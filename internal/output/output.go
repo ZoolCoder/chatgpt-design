@@ -37,10 +37,14 @@ var conv = converter.NewConverter(converter.WithPlugins(
 	table.NewTablePlugin(),
 ))
 
+// escapedNumber matches "1\." at a line start: ChatGPT writes numbered steps as paragraphs, and the
+// converter escapes them so they do not become a list. They read as a list, so drop the escape.
+var escapedNumber = regexp.MustCompile(`(?m)^(\d+)\\\.`)
+
 // Markdown converts the answer's HTML, falling back to its plain text.
 func Markdown(r *browser.Result) string {
 	if md, err := conv.ConvertString(r.HTML); err == nil && strings.TrimSpace(md) != "" {
-		return strings.TrimSpace(md) + "\n"
+		return escapedNumber.ReplaceAllString(strings.TrimSpace(md), "$1.") + "\n"
 	}
 	return strings.TrimSpace(r.Text) + "\n"
 }

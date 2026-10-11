@@ -29,6 +29,7 @@ const (
 // Request is one message to ChatGPT.
 type Request struct {
 	Prompt     string
+	ChatURL    string   // continue this conversation; empty starts a new one
 	Files      []string // absolute paths of images to attach
 	WantImages bool     // the answer is not done until it carries an image
 	Timeout    time.Duration
@@ -54,10 +55,58 @@ type pageState struct {
 	Composer bool `json:"composer"`
 }
 
-const stateJS = `(() => ({
+// Page selectors, newest layout first. ChatGPT renames these often; keep the old ones as fallbacks.
+const (
+	selComposer = "#prompt-textarea, div.ProseMirror[contenteditable=true], div[role=textbox][contenteditable=true], form textarea"
+	selSend     = "[data-testid=send-button], #composer-submit-button, form button[type=submit]"
+	selStop     = "[data-testid=stop-button], button[aria-label^=Stop]"
+)
+
+// Turn and answer selectors, one per layout; the first that matches wins, so layouts never mix.
+var (
+	selUserTurns      = []string{`[data-message-author-role="user"]`, `[data-chatgpt-search-unit-key$=":user"]`}
+	selAssistantTurns = []string{`[data-message-author-role="assistant"]`, `[data-chatgpt-search-unit-key$=":assistant"]`}
+	selAnswerBody     = []string{`.markdown`, `[data-markdown-text-style="assistant-message"]`}
+)
+
+// Generated images can render in a gallery outside the assistant turn.
+const selGenerated = "[data-testid=generated-image-gallery] img, [data-testid=generated-image-preview] img"
+
+// js fills a script's placeholders: COMPOSER, SEND and STOP become selector strings; USER_TURNS and
+// ASSISTANT_TURNS become arrays of turn elements; BODIES(t) becomes the answer blocks inside turn t.
+func js(src string) string {
+	lit := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+	first := func(root string, sels []string) string {
+		return `((root, sels) => { for (const s of sels) { const n = root.querySelectorAll(s); if (n.length) return [...n]; } return []; })(` + root + `, ` + lit(sels) + `)`
+	}
+	return strings.NewReplacer(
+		"COMPOSER", lit(selComposer), "SEND", lit(selSend), "STOP", lit(selStop), "GENERATED", lit(selGenerated),
+		"USER_TURNS", first("document", selUserTurns),
+		"ASSISTANT_TURNS", first("document", selAssistantTurns),
+		"BODIES(t)", `((t) => { const b = `+first("t", selAnswerBody)+`; return b.length ? b : [t]; })(t)`,
+	).Replace(src)
+}
+
+var stateJS = js(`(() => ({
   login: !!document.querySelector('[data-testid="login-button"], a[href*="/auth/login"]'),
-  composer: !!document.querySelector('#prompt-textarea'),
-}))()`
+  composer: !!document.querySelector(COMPOSER),
+}))()`)
+
+// sessionJS asks chatgpt.com whether its cookies hold a session: true, false, or null when the
+// tab is on another site or the check failed. Only the presence of a user is read, never a token.
+const sessionJS = `(async () => {
+  if (location.hostname !== 'chatgpt.com') return null;
+  try {
+    const r = await fetch('/api/auth/session', {credentials: 'include'});
+    if (!r.ok) return null;
+    const j = await r.json();
+    return !!(j && j.user);
+  } catch { return null; }
+})()`
+
+func session(ctx context.Context) (*bool, error) {
+	return eval[*bool](ctx, sessionJS, chromedp.EvalAwaitPromise)
+}
 
 // Login opens ChatGPT in the dedicated profile and waits until the user has signed in.
 func Login(ctx context.Context, timeout time.Duration, log func(string, ...any)) error {
@@ -67,7 +116,8 @@ func Login(ctx context.Context, timeout time.Duration, log func(string, ...any))
 	log("Sign in to ChatGPT in the Chrome window that just opened. Waiting up to %s.", timeout)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if st, err := eval[pageState](ctx, stateJS); err == nil && st.Composer && !st.Login {
+		// The sign-in can finish in a popup or another tab, so ask the server, not this tab's page.
+		if ok, err := session(ctx); err == nil && ok != nil && *ok {
 			log("Signed in. The session is kept in the chatgpt-design Chrome profile.")
 			return nil
 		}
@@ -82,7 +132,14 @@ func Login(ctx context.Context, timeout time.Duration, log func(string, ...any))
 func Ask(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	if err := chromedp.Do(ctx, chromedp.Navigate(Home)); err != nil {
+	start := Home
+	if r.ChatURL != "" {
+		if !isChatURL(r.ChatURL) {
+			return nil, fmt.Errorf("%q is not a ChatGPT conversation URL", r.ChatURL)
+		}
+		start = r.ChatURL
+	}
+	if err := chromedp.Do(ctx, chromedp.Navigate(start)); err != nil {
 		return nil, err
 	}
 	if err := waitFor(ctx, time.Minute, func() (bool, error) {
@@ -97,6 +154,12 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("open ChatGPT: %w", err)
 	}
+	if r.ChatURL != "" {
+		r.Log("continuing %s", r.ChatURL)
+		if err := waitHistory(ctx); err != nil {
+			return nil, err
+		}
+	}
 
 	if len(r.Files) > 0 {
 		r.Log("attaching %d file(s)", len(r.Files))
@@ -105,7 +168,7 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 		}
 	}
 
-	before, err := assistantTurns(ctx)
+	base, err := eval[baseline](ctx, baselineJS)
 	if err != nil {
 		return nil, err
 	}
@@ -117,16 +180,17 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 		return nil, err
 	}
 	r.Log("waiting for the answer")
-	if err := waitAnswer(ctx, before, r); err != nil {
+	if err := waitAnswer(ctx, base, r); err != nil {
 		return nil, err
 	}
-	return harvest(ctx, before)
+	return harvest(ctx, base)
 }
 
 func attach(ctx context.Context, files []string) error {
 	const pick = `(() => {
   const ins = [...document.querySelectorAll('input[type="file"]')];
   const el = ins.find(i => i.id === 'upload-files')
+    || ins.find(i => /attach (files|photos)$/i.test(i.getAttribute('aria-label') || ''))
     || ins.find(i => !i.hasAttribute('capture') && (!i.accept || /image/.test(i.accept)))
     || ins[0];
   if (!el) return false;
@@ -139,12 +203,12 @@ func attach(ctx context.Context, files []string) error {
 	if err := chromedp.Do(ctx, chromedp.SetUploadFiles(chromedp.CSS(`input[data-cgd-upload]`), files)); err != nil {
 		return fmt.Errorf("attach files: %w", err)
 	}
-	const uploads = `(() => {
-  const form = document.querySelector('#prompt-textarea')?.closest('form') || document.body;
+	uploads := js(`(() => {
+  const form = document.querySelector(COMPOSER)?.closest('form') || document.body;
   const imgs = [...form.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 0).length;
   const busy = !!form.querySelector('[role="progressbar"], .animate-spin, circle[stroke-dasharray]');
   return { imgs, busy };
-})()`
+})()`)
 	return waitFor(ctx, 3*time.Minute, func() (bool, error) {
 		st, err := eval[struct {
 			Imgs int  `json:"imgs"`
@@ -159,8 +223,8 @@ func attach(ctx context.Context, files []string) error {
 
 func typePrompt(ctx context.Context, prompt string) error {
 	lit, _ := json.Marshal(prompt)
-	js := `((p) => {
-  const el = document.querySelector('#prompt-textarea');
+	src := js(`((p) => {
+  const el = document.querySelector(COMPOSER);
   if (!el) return -1;
   el.focus();
   if (el.tagName === 'TEXTAREA') {
@@ -172,8 +236,8 @@ func typePrompt(ctx context.Context, prompt string) error {
   document.execCommand('insertText', false, p);
   el.dispatchEvent(new InputEvent('input', { bubbles: true }));
   return el.innerText.length;
-})(` + string(lit) + `)`
-	n, err := eval[int](ctx, js)
+})(`) + string(lit) + `)`
+	n, err := eval[int](ctx, src)
 	if err != nil {
 		return fmt.Errorf("type the prompt: %w", err)
 	}
@@ -185,7 +249,7 @@ func typePrompt(ctx context.Context, prompt string) error {
 }
 
 func send(ctx context.Context) error {
-	const ready = `(() => { const b = document.querySelector('[data-testid="send-button"]'); return !!b && !b.disabled; })()`
+	ready := js(`(() => { const b = document.querySelector(SEND); return !!b && !b.disabled; })()`)
 	if err := waitFor(ctx, time.Minute, func() (bool, error) {
 		ok, _ := eval[bool](ctx, ready)
 		return ok, nil
@@ -193,26 +257,64 @@ func send(ctx context.Context) error {
 		return errors.New("the send button never became ready")
 	}
 	users := func() int {
-		n, _ := eval[int](ctx, `document.querySelectorAll('[data-message-author-role="user"]').length`)
+		n, _ := eval[int](ctx, js(`USER_TURNS.length`))
 		return n
 	}
 	before := users()
-	if err := chromedp.Do(ctx, chromedp.Click(chromedp.CSS(`[data-testid="send-button"]`))); err != nil {
+	if err := chromedp.Do(ctx, chromedp.Click(chromedp.CSS(selSend))); err != nil {
 		return fmt.Errorf("click send: %w", err)
 	}
 	if waitFor(ctx, 15*time.Second, func() (bool, error) { return users() > before, nil }) == nil {
 		return nil
 	}
 	// A missed click leaves the prompt in the composer; a DOM click is the fallback.
-	_, _ = eval[chromedp.Void](ctx, `document.querySelector('[data-testid="send-button"]')?.click()`)
+	_, _ = eval[chromedp.Void](ctx, js(`document.querySelector(SEND)?.click()`))
 	if waitFor(ctx, 15*time.Second, func() (bool, error) { return users() > before, nil }) != nil {
 		return errors.New("the message was not sent")
 	}
 	return nil
 }
 
-func assistantTurns(ctx context.Context) (int, error) {
-	return eval[int](ctx, `document.querySelectorAll('[data-message-author-role="assistant"]').length`)
+// baseline is what the conversation held before this message, so only newer turns and images count.
+type baseline struct {
+	Turns int `json:"turns"`
+	Gen   int `json:"gen"`
+}
+
+var baselineJS = js(`({ turns: ASSISTANT_TURNS.length, gen: document.querySelectorAll(GENERATED).length })`)
+
+func isChatURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && (u.Host == "chatgpt.com" || u.Host == "chat.openai.com") && strings.HasPrefix(u.Path, "/c/")
+}
+
+// waitHistory waits until a continued conversation shows its earlier turns and stops growing.
+func waitHistory(ctx context.Context) error {
+	gone := errors.New("the session's ChatGPT conversation did not open (deleted, or another account): start a new session")
+	prev, stable := -1, 0
+	err := waitFor(ctx, 45*time.Second, func() (bool, error) {
+		st, err := eval[struct {
+			Turns int  `json:"turns"`
+			Chat  bool `json:"chat"`
+		}](ctx, js(`({ turns: ASSISTANT_TURNS.length, chat: location.pathname.startsWith('/c/') })`))
+		if err != nil {
+			return false, nil
+		}
+		if !st.Chat {
+			return false, gone
+		}
+		if st.Turns > 0 && st.Turns == prev {
+			stable++
+		} else {
+			stable = 0
+		}
+		prev = st.Turns
+		return stable >= 4, nil
+	})
+	if err != nil && prev <= 0 {
+		return gone
+	}
+	return err
 }
 
 type answerState struct {
@@ -225,21 +327,25 @@ type answerState struct {
 	ErrMsg string `json:"err"`
 }
 
-const answerJS = `(() => {
-  const turns = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+var answerJS = js(`((before, genBase) => {
+  const turns = ASSISTANT_TURNS;
   const last = turns[turns.length - 1];
-  const stop = !!document.querySelector('[data-testid="stop-button"]');
+  const stop = !!document.querySelector(STOP);
   const page = document.body.innerText;
   const limit = (page.match(/You[’']ve (?:hit|reached) [^.\n]*limit[^.\n]*/i) || [''])[0];
   const err = (page.match(/Something went wrong[^\n]*|There was an error generating a response/i) || [''])[0];
-  if (!last) return { n: 0, stop, len: 0, imgs: 0, busy: false, limit, err };
+  const big = i => i.complete && (i.naturalWidth || 0) >= 256;
+  const gen = [...document.querySelectorAll(GENERATED)].slice(genBase).filter(big).length;
+  const busy = /creating image|generating image|image is being/i.test(page);
+  if (turns.length <= before) return { n: turns.length, stop, len: 0, imgs: gen, busy, limit, err };
   const scope = last.closest('article') || last;
-  const imgs = [...scope.querySelectorAll('img')].filter(i => i.complete && (i.naturalWidth || 0) >= 256).length;
-  const busy = /creating image|generating image|image is being/i.test(scope.innerText);
+  const imgs = gen + [...scope.querySelectorAll('img')].filter(big).length;
   return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err };
-})()`
+})`)
 
-func waitAnswer(ctx context.Context, before int, r Request) error {
+func waitAnswer(ctx context.Context, base baseline, r Request) error {
+	before := base.Turns
+	check := fmt.Sprintf("(%s)(%d, %d)", answerJS, base.Turns, base.Gen)
 	var prev answerState
 	stable := 0
 	need := 3
@@ -247,7 +353,7 @@ func waitAnswer(ctx context.Context, before int, r Request) error {
 		need = 5
 	}
 	for {
-		st, err := eval[answerState](ctx, answerJS)
+		st, err := eval[answerState](ctx, check)
 		if err != nil {
 			return waitErr(ctx, err)
 		}
@@ -257,7 +363,12 @@ func waitAnswer(ctx context.Context, before int, r Request) error {
 		if st.ErrMsg != "" && !st.Stop {
 			return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
 		}
-		done := st.N > before && !st.Stop && !st.Busy && st.Len > 0 && (!r.WantImages || st.Imgs > 0)
+		// An image answer can come without any text turn, so images alone complete it.
+		answered := st.N > before && st.Len > 0
+		if r.WantImages {
+			answered = st.Imgs > 0
+		}
+		done := answered && !st.Stop && !st.Busy
 		if done && st.Len == prev.Len && st.Imgs == prev.Imgs {
 			stable++
 		} else {
@@ -283,30 +394,31 @@ func waitErr(ctx context.Context, err error) error {
 	return err
 }
 
-func harvest(ctx context.Context, before int) (*Result, error) {
+func harvest(ctx context.Context, base baseline) (*Result, error) {
 	res := &Result{}
-	js := fmt.Sprintf(`(() => {
-  const turns = [...document.querySelectorAll('[data-message-author-role="assistant"]')].slice(%d);
+	src := fmt.Sprintf(js(`(() => {
+  const turns = ASSISTANT_TURNS.slice(%d);
   return {
-    html: turns.map(t => (t.querySelector('.markdown') || t).innerHTML).join('\n'),
+    html: turns.map(t => BODIES(t).map(b => b.innerHTML).join('\n')).join('\n'),
     text: turns.map(t => t.innerText).join('\n\n'),
     url: location.href,
   };
-})()`, before)
+})()`), base.Turns)
 	out, err := eval[struct {
 		HTML string `json:"html"`
 		Text string `json:"text"`
 		URL  string `json:"url"`
-	}](ctx, js)
+	}](ctx, src)
 	if err != nil {
 		return nil, fmt.Errorf("read the answer: %w", err)
 	}
 	res.HTML, res.Text, res.URL = out.HTML, out.Text, out.URL
 
-	imgJS := fmt.Sprintf(`(async () => {
-  const turns = [...document.querySelectorAll('[data-message-author-role="assistant"]')].slice(%d);
+	imgJS := fmt.Sprintf(js(`(async () => {
+  const turns = ASSISTANT_TURNS.slice(%d);
   const seen = new Set(), out = [];
-  for (const t of turns) for (const i of (t.closest('article') || t).querySelectorAll('img')) {
+  const imgs = [...turns.flatMap(t => [...(t.closest('article') || t).querySelectorAll('img')]), ...[...document.querySelectorAll(GENERATED)].slice(%d)];
+  for (const i of imgs) {
     if ((i.naturalWidth || 0) < 256) continue;
     const src = i.currentSrc || i.src;
     if (!src || seen.has(src)) continue;
@@ -319,7 +431,7 @@ func harvest(ctx context.Context, before int) (*Result, error) {
     } catch (e) { out.push({ src }); }
   }
   return out;
-})()`, before)
+})()`), base.Turns, base.Gen)
 	imgs, err := eval[[]struct {
 		Data string `json:"data"`
 		Src  string `json:"src"`
@@ -479,17 +591,17 @@ func LoggedIn(ctx context.Context) (bool, error) {
 	if err := chromedp.Do(ctx, chromedp.Navigate(Home)); err != nil {
 		return false, err
 	}
-	var st pageState
+	var in bool
 	err := waitFor(ctx, 45*time.Second, func() (bool, error) {
-		got, err := eval[pageState](ctx, stateJS)
-		if err != nil {
+		ok, err := session(ctx)
+		if err != nil || ok == nil {
 			return false, nil
 		}
-		st = got
-		return st.Login || st.Composer, nil
+		in = *ok
+		return true, nil
 	})
 	if err != nil {
 		return false, errors.New("ChatGPT did not load (a bot check or no network)")
 	}
-	return !st.Login, nil
+	return in, nil
 }

@@ -44,3 +44,10 @@ func TestSaveWarnsWithoutVerdict(t *testing.T) {
 		t.Errorf("warnings %v, err %v", m.Warnings, err)
 	}
 }
+
+func TestMarkdownNumberedParagraphs(t *testing.T) {
+	got := Markdown(&browser.Result{HTML: "<p>1. First step.</p><p>2. Second step.</p>"})
+	if got != "1. First step.\n\n2. Second step.\n" {
+		t.Errorf("%q", got)
+	}
+}
