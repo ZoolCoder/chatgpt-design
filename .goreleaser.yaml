@@ -1,0 +1,50 @@
+# goreleaser release --clean   (CI runs it on every v* tag, see .github/workflows/release.yml)
+version: 2
+
+project_name: chatgpt-design
+
+builds:
+  - main: ./cmd/chatgpt-design
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude: ['^docs', '^chore', '^ci', '^test']
+
+release:
+  prerelease: auto
+
+# The cask lives in this repo: brew tap zoolcoder/chatgpt-design https://github.com/zoolcoder/chatgpt-design
+homebrew_casks:
+  - name: chatgpt-design
+    repository:
+      owner: zoolcoder
+      name: chatgpt-design
+      branch: main
+    directory: Casks
+    commit_author:
+      name: goreleaser
+      email: goreleaser@users.noreply.github.com
+    commit_msg_template: "chore(brew): cask for {{ .Tag }}"
+    homepage: https://github.com/zoolcoder/chatgpt-design
+    description: Send screenshots and a design prompt to your own ChatGPT, save the mockups
+    license: MIT

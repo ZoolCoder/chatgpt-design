@@ -1,0 +1,20 @@
+You are a brand designer. I need logo concepts for the product described below.
+
+PROJECT BRIEF
+{{BRIEF}}
+
+BRAND CONSTRAINTS
+{{BRAND}}
+
+Do this, in order:
+
+1. In at most 100 words, describe the brand personality this product should project,
+   grounded in what it actually does.
+2. Generate three distinct logo concepts as images. For each: a horizontal lockup
+   (mark plus wordmark) on a light background. Distinct means different ideas, not
+   three weights of the same idea.
+3. Generate the standalone mark of your strongest concept as a square app icon.
+4. For each concept, give one sentence on the idea behind it and the hex colors used.
+
+Vector-clean shapes. No photographic textures, no 3D bevels, no drop shadows, no
+mockup scenes of the logo on a business card or a storefront.

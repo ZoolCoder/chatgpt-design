@@ -1,0 +1,27 @@
+You are a senior product designer. I am going to have you redesign an existing
+application. I have attached {{SCREEN_COUNT}} screenshots of the current UI.
+
+PROJECT BRIEF
+{{BRIEF}}
+
+BRAND CONSTRAINTS
+{{BRAND}}
+
+SCREENS ATTACHED
+{{SHOT_LIST}}
+
+Do this, in order:
+
+1. In at most 150 words, name the three biggest problems with the current design.
+   Be specific about what you see in the screenshots — no generic advice.
+2. State the design direction you will take and why it fits this product.
+3. Generate one redesigned mockup image per attached screen. Each image must be a
+   realistic, high-fidelity UI mockup at desktop proportions, showing plausible real
+   content from the brief — not lorem ipsum, not a wireframe, not an annotated
+   diagram.
+4. After the images, list the design tokens you used: hex colors with roles, font
+   families and sizes, base spacing unit, corner radius.
+
+Do not output HTML, CSS, or component code — images and prose only.
+
+Respect the brand constraints. If you deliberately break one, say which and why.

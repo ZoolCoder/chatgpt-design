@@ -1,0 +1,45 @@
+You are a design systems lead doing a written critique. I have attached
+{{SCREEN_COUNT}} screenshots of an existing application. Do not generate any images.
+
+PROJECT BRIEF
+{{BRIEF}}
+
+BRAND CONSTRAINTS
+{{BRAND}}
+
+SCREENS ATTACHED
+{{SHOT_LIST}}
+
+Produce a markdown document with exactly these sections:
+
+## Verdict
+Two sentences. Is this design working, and what is the single highest-leverage fix?
+
+## Keep
+Two or three things that already work and must survive a redesign — a pattern, a piece
+of hierarchy, a brand move. Name each and say why it earns its place. A critique that
+only lists problems invites throwing out what was right.
+
+## Findings
+A table with columns: Screen, Issue, Severity (high/medium/low), Fix. One row per
+issue, ordered by severity. Every row must cite something visible in a screenshot — no
+generic advice that could apply to any app.
+
+Across the whole table, cover all four of these lenses; do not skip one because it is
+harder to see:
+- Usability — can the user reach their goal; are actions obvious; any wasted steps.
+- Visual hierarchy — reading order, emphasis, whitespace, type carrying the structure.
+- Consistency — spacing, colour, and type against the brand constraints and against
+  each other; do similar elements behave alike.
+- Accessibility — with concrete checks, not a mention: text contrast against its
+  background (name the pair and whether it clears WCAG AA 4.5:1, or 3:1 for large
+  text), touch/click target size, and text legibility at real sizes.
+
+## Tokens
+The token set you would standardise on: colors with hex and role, type scale with
+sizes and weights, spacing scale, radii, elevation. Concrete values only.
+
+## Sequence
+The order to apply the fixes in, and why that order.
+
+No preamble, no closing summary, no offers to help further.
