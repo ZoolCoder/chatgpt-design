@@ -6,17 +6,17 @@ Get ChatGPT's design opinion from the terminal or from your coding agent. `chatg
 - the answer as markdown
 - a link to the chat, so you can follow up there
 
-Follow-ups go to the same ChatGPT chat until you start a new session, so ChatGPT remembers your screenshots and its earlier answers. Every round is kept in your project under `design/chatgpt/`.
+A session is your agent session: Claude Code's session id, or one you name. Follow-ups go to the same ChatGPT chat for the whole session, so ChatGPT remembers your screenshots and its earlier answers. Everything is kept in one folder per session under `design/chatgpt/`.
 
 There is no API key and no per-image billing. It is one Go binary that drives a dedicated Chrome profile, which you sign in to once. It ships with an agent skill, so Claude Code, Codex and other agents use it when you say "redesign this", "give me mockups" or "ask ChatGPT".
 
 ```
-chatgpt-design session new settings redesign
+export CHATGPT_DESIGN_SESSION=settings   # not needed inside Claude Code
 chatgpt-design shoot --base http://localhost:3000 overview=/ settings=/settings
 chatgpt-design ask --mode redesign
-# design/chatgpt/sessions/2026-10-12-settings-redesign/rounds/01/response.md, images/01.png ...
+# design/chatgpt/settings/chat.md, images/01.png ...
 chatgpt-design ask --mode chat --prompt - <<< "Make the settings mockup denser"
-# same chat, saved as rounds/02/
+# same chat, appended to chat.md, images/02.png
 ```
 
 ## Install
@@ -37,7 +37,7 @@ Prebuilt binaries for macOS, Linux and Windows are on the [releases page](https:
 ## Set up once
 
 ```sh
-chatgpt-design login           # opens Chrome, you sign in to chatgpt.com, the window closes by itself
+chatgpt-design login           # opens Chrome, you sign in to chatgpt.com; Chrome stays open for later runs
 chatgpt-design status          # prints: logged in
 chatgpt-design install-skill   # adds the skill for Claude Code, Codex and other agents
 ```
@@ -68,26 +68,24 @@ In Claude Code, run the login with `! chatgpt-design login`, so it runs in your 
 
 ## Commands
 
-### `session`: one ChatGPT chat per topic
+### `session`: one ChatGPT chat per agent session
+
+The session id comes from, in order: `--session ID`, `CHATGPT_DESIGN_SESSION`, then `CLAUDE_CODE_SESSION_ID`, which Claude Code sets by itself. In Codex or a plain terminal, set `CHATGPT_DESIGN_SESSION` or pass `--session`.
 
 ```sh
-chatgpt-design session new onboarding     # start a session; the next ask opens a new chat
-chatgpt-design session show               # the current session: chat URL and rounds
-chatgpt-design session list               # every session, * marks the current one
-chatgpt-design session use 2026-10-01-logo  # switch back to an older one
+chatgpt-design session        # this session: folder, chat URL, number of asks
+chatgpt-design session list   # every session in the project, * marks this one
 ```
 
 Each project keeps its memory in `design/chatgpt/`, at the root of the git repository you run from (or `--project DIR`):
 
 ```
-design/chatgpt/
-  project.json                     the current session
-  sessions/<date>-<topic>/
-    session.json                   topic, chat URL, every round
-    brief.md
-    shots/
-    rounds/01/                     prompt.txt, response.md, images/, meta.json
-    rounds/02/ ...
+design/chatgpt/<session>/
+  session.json                     chat URL, when it started, how many asks
+  chat.md                          every prompt and answer, images inline
+  images/                          01.png, 02.png ... numbered across the session
+  shots/                           screenshots to send
+  brief.md                         optional brief
 ```
 
 Commit it to keep the design history with the code, or add it to `.gitignore`.
@@ -121,30 +119,33 @@ chatgpt-design ask --mode spec --goal "fewer setup steps for non-developers"
 | `logo` | three logo concepts and an app icon; needs no screenshots |
 | `chat` | the answer to any prompt: `--prompt FILE` or `--prompt -` for stdin |
 
-`ask` sends to the current session's chat and saves the round in `rounds/NN/`. The first round reads `brief.md` and attaches every image in `shots/`. Later rounds attach only the screenshots you pass with `--shot`, because the chat already has the others.
+`ask` sends to the session's chat and appends the prompt and answer to `chat.md`. The first ask of a chat reads `brief.md` and attaches every image in `shots/`. Later asks attach only the screenshots you pass with `--shot`, because the chat already has the others.
 
 | Flag | |
 |---|---|
-| `--new --topic TOPIC` | start a new session, and a new chat, first |
-| `--session ID` | send to another session without switching to it |
+| `--new` | start a new ChatGPT chat in this session |
+| `--session ID` | use this session instead of the agent's |
 | `--brief` | a brief file other than `SESSION/brief.md` |
 | `--shot` | one screenshot; repeat it for more, up to 10 |
 | `--brand` | a brand sheet |
-| `--goal` | one line on what this round should optimise for |
+| `--goal` | one line on what this ask should optimise for |
 
 `--dry-run` prints the exact prompt, file list and target chat without opening Chrome or creating anything.
 
-Each round directory holds:
+The session folder holds:
 
 | File | Contents |
 |---|---|
-| `response.md` | the answer, tables included |
-| `images/NN.png` | generated images, at full resolution |
-| `prompt.txt` | what was sent |
-| `meta.json` | mode, chat URL, file list, warnings |
+| `chat.md` | every prompt (folded) and answer, tables included, images inline |
+| `images/NN.png` | generated images, at full resolution, numbered across the session |
+| `session.json` | chat URL, start time, number of asks |
 | `error.png` | a screenshot of the page when a run fails |
 
-`redesign` and `logo` can take 5 to 15 minutes. The default `--timeout` is 20m. A Chrome window opens during the run; leave it alone.
+`redesign` and `logo` can take 5 to 15 minutes. The default `--timeout` is 20m.
+
+### `browser stop`: quit the background Chrome
+
+The first command starts Chrome on the tool's profile and leaves it running. Every later run attaches to it, opens one tab and closes only that tab, so you stay signed in, nothing reloads from cold, and Chrome never sees an unclean shutdown. Leave the window alone during a run. `chatgpt-design browser stop` quits it cleanly.
 
 ### Exit codes
 

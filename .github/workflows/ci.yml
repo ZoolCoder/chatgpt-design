@@ -23,4 +23,4 @@ jobs:
       - run: make lint
       - run: make race
       - run: make build
-      - run: ./bin/chatgpt-design ask --new --topic ci --mode logo --brief README.md --dry-run > /dev/null
+      - run: ./bin/chatgpt-design ask --session ci --mode logo --brief README.md --dry-run > /dev/null

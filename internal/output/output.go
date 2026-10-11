@@ -2,7 +2,6 @@
 package output
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,15 +18,13 @@ import (
 	"github.com/zoolcoder/chatgpt-design/internal/browser"
 )
 
-// Meta records where an answer came from.
-type Meta struct {
-	Mode     string    `json:"mode"`
-	URL      string    `json:"url"`
-	Created  time.Time `json:"created"`
-	Shots    []string  `json:"shots,omitempty"`
-	Images   []string  `json:"images,omitempty"`
-	Response string    `json:"response"`
-	Warnings []string  `json:"warnings,omitempty"`
+// Entry is one ask: what was sent and what came back.
+type Entry struct {
+	Mode     string
+	At       time.Time
+	Shots    []string
+	Images   []string
+	Warnings []string
 }
 
 var conv = converter.NewConverter(converter.WithPlugins(
@@ -54,38 +51,73 @@ var verdict = regexp.MustCompile(`(?m)^#{1,6}\s*Verdict\b`)
 // HasVerdict reports whether a spec answer kept the required first section.
 func HasVerdict(md string) bool { return verdict.MatchString(md) }
 
-// Save writes prompt.txt, response.md, images/NN.ext and meta.json under dir.
-func Save(dir, prompt string, r *browser.Result, m Meta) (Meta, error) {
+// Save appends the prompt and the answer to dir/chat.md and writes the images to dir/images,
+// numbered after the ones already there. Paths in the entry are relative to dir.
+func Save(dir, prompt string, r *browser.Result, e Entry) (Entry, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return m, err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "prompt.txt"), []byte(prompt), 0o644); err != nil {
-		return m, err
+		return e, err
 	}
 	md := Markdown(r)
-	if m.Mode == "spec" && !HasVerdict(md) {
-		m.Warnings = append(m.Warnings, "the answer has no Verdict heading: ChatGPT did not follow the spec format")
+	if e.Mode == "spec" && !HasVerdict(md) {
+		e.Warnings = append(e.Warnings, "the answer has no Verdict heading: ChatGPT did not follow the spec format")
 	}
-	m.Response = filepath.Join(dir, "response.md")
-	if err := os.WriteFile(m.Response, []byte(md), 0o644); err != nil {
-		return m, err
+	if len(r.Images) > 0 && strings.TrimSpace(md) == "" {
+		e.Warnings = append(e.Warnings, "the answer has images but no text")
 	}
 	if len(r.Images) > 0 {
 		imgDir := filepath.Join(dir, "images")
 		if err := os.MkdirAll(imgDir, 0o755); err != nil {
-			return m, err
+			return e, err
+		}
+		n, err := countImages(imgDir)
+		if err != nil {
+			return e, err
 		}
 		for i, im := range r.Images {
-			p := filepath.Join(imgDir, fmt.Sprintf("%02d%s", i+1, ext(im.Type)))
-			if err := os.WriteFile(p, im.Data, 0o644); err != nil {
-				return m, err
+			name := fmt.Sprintf("%02d%s", n+i+1, ext(im.Type))
+			if err := os.WriteFile(filepath.Join(imgDir, name), im.Data, 0o644); err != nil {
+				return e, err
 			}
-			m.Images = append(m.Images, p)
+			e.Images = append(e.Images, "images/"+name)
 		}
 	}
-	m.URL, m.Created = r.URL, time.Now().UTC().Truncate(time.Second)
-	b, _ := json.MarshalIndent(m, "", "  ")
-	return m, os.WriteFile(filepath.Join(dir, "meta.json"), append(b, '\n'), 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, "chat.md"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return e, err
+	}
+	defer f.Close()
+	_, err = f.WriteString(entryMarkdown(prompt, md, e))
+	return e, err
+}
+
+func entryMarkdown(prompt, answer string, e Entry) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n---\n\n## %s · %s\n\n", e.At.Local().Format("2006-01-02 15:04"), e.Mode)
+	if len(e.Shots) > 0 {
+		fmt.Fprintf(&b, "Sent: %s\n\n", strings.Join(e.Shots, ", "))
+	}
+	fmt.Fprintf(&b, "<details><summary>Prompt</summary>\n\n%s\n\n</details>\n\n", strings.TrimSpace(prompt))
+	if a := strings.TrimSpace(answer); a != "" {
+		b.WriteString(a + "\n\n")
+	}
+	for _, im := range e.Images {
+		fmt.Fprintf(&b, "![%s](%s)\n\n", filepath.Base(im), im)
+	}
+	return b.String()
+}
+
+func countImages(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func ext(mime string) string {

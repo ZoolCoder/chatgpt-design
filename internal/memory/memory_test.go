@@ -1,7 +1,6 @@
 package memory
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,75 +23,58 @@ func TestSessions(t *testing.T) {
 	if want := filepath.Join(root, "design", "chatgpt"); p.Root != want {
 		t.Fatalf("root = %s, want %s", p.Root, want)
 	}
-	if _, err := p.Current(); !errors.Is(err, ErrNoSession) {
-		t.Fatalf("current before any session: %v", err)
-	}
 
-	day := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
-	a, err := p.New("Simple onboarding!", day)
+	now := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
+	s, err := p.Session("b03c93e0-40e2", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ID != "2026-10-12-simple-onboarding" {
-		t.Fatalf("id = %s", a.ID)
+	if s.Saved() || s.Dir() != filepath.Join(p.Root, "b03c93e0-40e2") {
+		t.Fatalf("fresh session: saved %v, dir %s", s.Saved(), s.Dir())
 	}
-	if err := a.AddRound(Round{Mode: "spec", Response: "rounds/01/response.md"}, "https://chatgpt.com/c/abc"); err != nil {
+	if err := s.Record("https://chatgpt.com/c/abc", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.AddRound(Round{Mode: "redesign"}, ""); err != nil {
+	if err := s.Record("", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
-	b, err := p.New("simple onboarding", day)
+	again, err := p.Session("b03c93e0-40e2", now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.ID != "2026-10-12-simple-onboarding-2" {
-		t.Fatalf("second id = %s", b.ID)
+	if again.ChatURL != "https://chatgpt.com/c/abc" || again.Asks != 2 || !again.Created.Equal(now) {
+		t.Fatalf("reloaded session = %+v", again)
 	}
-	if cur, _ := p.Current(); cur.ID != b.ID {
-		t.Fatalf("new session is not current: %s", cur.ID)
-	}
-
-	if err := p.Use(a.ID); err != nil {
-		t.Fatal(err)
-	}
-	cur, err := p.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cur.ChatURL != "https://chatgpt.com/c/abc" || len(cur.Rounds) != 2 || cur.Rounds[1].N != 2 {
-		t.Fatalf("reloaded session = %+v", cur)
-	}
-	if got := cur.NextRoundDir(); got != filepath.Join(a.Dir(), "rounds", "03") {
-		t.Fatalf("next round dir = %s", got)
+	again.NewChat()
+	if again.ChatURL != "" {
+		t.Fatal("NewChat kept the chat")
 	}
 	all, err := p.List()
-	if err != nil || len(all) != 2 {
+	if err != nil || len(all) != 1 {
 		t.Fatalf("list = %d, %v", len(all), err)
 	}
 }
 
-func TestRejectsBadIDs(t *testing.T) {
-	p := &Project{Root: t.TempDir()}
-	for _, id := range []string{"../x", "", "A", "a/b"} {
-		if err := p.Use(id); err == nil {
-			t.Errorf("Use(%q) worked", id)
-		}
+func TestSessionID(t *testing.T) {
+	env := map[string]string{"CLAUDE_CODE_SESSION_ID": "B03C93E0-40E2"}
+	get := func(k string) string { return env[k] }
+	if id, err := SessionID("", get); err != nil || id != "b03c93e0-40e2" {
+		t.Errorf("from Claude Code: %q, %v", id, err)
 	}
-	if _, err := p.New("!!!", time.Now()); err == nil {
-		t.Error("New with an empty slug worked")
+	env["CHATGPT_DESIGN_SESSION"] = "logo"
+	if id, _ := SessionID("", get); id != "logo" {
+		t.Errorf("override: %q", id)
 	}
-}
-
-func TestSlug(t *testing.T) {
-	for in, want := range map[string]string{
-		"Dashboard redesign": "dashboard-redesign",
-		"  --Logo v2--  ":    "logo-v2",
-		"Ünïcode only":       "n-code-only",
-	} {
-		if got := Slug(in); got != want {
-			t.Errorf("Slug(%q) = %q, want %q", in, got, want)
+	if id, _ := SessionID("mine", get); id != "mine" {
+		t.Errorf("flag: %q", id)
+	}
+	if _, err := SessionID("", func(string) string { return "" }); err != ErrNoSession {
+		t.Errorf("none: %v", err)
+	}
+	for _, bad := range []string{"../x", "a/b", "-a"} {
+		if _, err := SessionID(bad, get); err == nil {
+			t.Errorf("SessionID(%q) worked", bad)
 		}
 	}
 }

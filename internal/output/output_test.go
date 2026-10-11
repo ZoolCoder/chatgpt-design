@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zoolcoder/chatgpt-design/internal/browser"
 )
@@ -18,30 +19,33 @@ func TestSave(t *testing.T) {
 		Images: []browser.Image{{Data: png, Type: "image/png"}},
 		URL:    "https://chatgpt.com/c/abc",
 	}
-	m, err := Save(dir, "the prompt", r, Meta{Mode: "spec"})
+	e, err := Save(dir, "the prompt", r, Entry{Mode: "spec", At: time.Now(), Shots: []string{"shots/01-home.png"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	md, _ := os.ReadFile(m.Response)
-	for _, want := range []string{"## Verdict", "| Inbox  | Fewer options |"} {
+	if len(e.Warnings) != 0 || len(e.Images) != 1 || e.Images[0] != "images/01.png" {
+		t.Errorf("entry: %+v", e)
+	}
+	e, err = Save(dir, "second", &browser.Result{HTML: "<p>More.</p>", Images: []browser.Image{{Data: png, Type: "image/jpeg"}}}, Entry{Mode: "redesign", At: time.Now()})
+	if err != nil || len(e.Images) != 1 || e.Images[0] != "images/02.jpg" {
+		t.Fatalf("second entry: %+v, %v", e, err)
+	}
+	md, _ := os.ReadFile(filepath.Join(dir, "chat.md"))
+	for _, want := range []string{"## Verdict", "| Inbox  | Fewer options |", "Sent: shots/01-home.png", "the prompt", "![01.png](images/01.png)", "More.", "![02.jpg](images/02.jpg)"} {
 		if !strings.Contains(string(md), want) {
-			t.Errorf("response.md lacks %q:\n%s", want, md)
-		}
-	}
-	if len(m.Warnings) != 0 || len(m.Images) != 1 || m.Images[0] != filepath.Join(dir, "images", "01.png") {
-		t.Errorf("meta: %+v", m)
-	}
-	for _, f := range []string{"prompt.txt", "meta.json", "images/01.png"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			t.Error(err)
+			t.Errorf("chat.md lacks %q:\n%s", want, md)
 		}
 	}
 }
 
-func TestSaveWarnsWithoutVerdict(t *testing.T) {
-	m, err := Save(t.TempDir(), "p", &browser.Result{HTML: "<p>Looks fine to me.</p>"}, Meta{Mode: "spec"})
-	if err != nil || len(m.Warnings) != 1 {
-		t.Errorf("warnings %v, err %v", m.Warnings, err)
+func TestSaveWarns(t *testing.T) {
+	e, err := Save(t.TempDir(), "p", &browser.Result{HTML: "<p>Looks fine to me.</p>"}, Entry{Mode: "spec"})
+	if err != nil || len(e.Warnings) != 1 {
+		t.Errorf("no verdict: warnings %v, err %v", e.Warnings, err)
+	}
+	e, err = Save(t.TempDir(), "p", &browser.Result{Images: []browser.Image{{Data: png}}}, Entry{Mode: "redesign"})
+	if err != nil || len(e.Warnings) != 1 {
+		t.Errorf("image only: warnings %v, err %v", e.Warnings, err)
 	}
 }
 
