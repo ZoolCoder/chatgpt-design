@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,5 +48,32 @@ func TestBuildPromptChat(t *testing.T) {
 	}
 	if _, err := buildPrompt("spec", "b.md", "", p, "", nil); err == nil {
 		t.Error("--prompt with spec accepted")
+	}
+}
+
+func TestBuildPromptRejects(t *testing.T) {
+	big := filepath.Join(t.TempDir(), "big.txt")
+	os.WriteFile(big, make([]byte, maxTextBytes+1), 0o644)
+	for name, err := range map[string]error{
+		"too big":      func() error { _, err := buildPrompt("chat", "", "", big, "", nil); return err }(),
+		"missing file": func() error { _, err := buildPrompt("chat", "", "", "/nonexistent", "", nil); return err }(),
+		"unknown mode": func() error { _, err := buildPrompt("poster", "b.md", "", "", "", nil); return err }(),
+	} {
+		var u usageError
+		if !errors.As(err, &u) {
+			t.Errorf("%s: want a usage error, got %v", name, err)
+		}
+	}
+}
+
+func TestChatURL(t *testing.T) {
+	for _, c := range []struct{ got, had, want string }{
+		{"https://chatgpt.com/c/new", "", "https://chatgpt.com/c/new"},
+		{"https://chatgpt.com/", "", ""},
+		{"https://chatgpt.com/c/other", "https://chatgpt.com/c/old", "https://chatgpt.com/c/old"},
+	} {
+		if got := chatURL(c.got, c.had); got != c.want {
+			t.Errorf("chatURL(%q, %q) = %q, want %q", c.got, c.had, got, c.want)
+		}
 	}
 }

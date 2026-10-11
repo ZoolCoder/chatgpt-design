@@ -6,12 +6,17 @@ Get ChatGPT's design opinion from the terminal or from your coding agent. `chatg
 - the answer as markdown
 - a link to the chat, so you can follow up there
 
+Follow-ups go to the same ChatGPT chat until you start a new session, so ChatGPT remembers your screenshots and its earlier answers. Every round is kept in your project under `design/chatgpt/`.
+
 There is no API key and no per-image billing. It is one Go binary that drives a dedicated Chrome profile, which you sign in to once. It ships with an agent skill, so Claude Code, Codex and other agents use it when you say "redesign this", "give me mockups" or "ask ChatGPT".
 
 ```
-chatgpt-design shoot --base http://localhost:3000 --out jam/shots overview=/ settings=/settings
-chatgpt-design ask --mode redesign --dir jam
-# jam/chatgpt/response.md, jam/chatgpt/images/01.png ..., jam/chatgpt/meta.json
+chatgpt-design session new settings redesign
+chatgpt-design shoot --base http://localhost:3000 overview=/ settings=/settings
+chatgpt-design ask --mode redesign
+# design/chatgpt/sessions/2026-10-12-settings-redesign/rounds/01/response.md, images/01.png ...
+chatgpt-design ask --mode chat --prompt - <<< "Make the settings mockup denser"
+# same chat, saved as rounds/02/
 ```
 
 ## Install
@@ -63,13 +68,37 @@ In Claude Code, run the login with `! chatgpt-design login`, so it runs in your 
 
 ## Commands
 
+### `session`: one ChatGPT chat per topic
+
+```sh
+chatgpt-design session new onboarding     # start a session; the next ask opens a new chat
+chatgpt-design session show               # the current session: chat URL and rounds
+chatgpt-design session list               # every session, * marks the current one
+chatgpt-design session use 2026-10-01-logo  # switch back to an older one
+```
+
+Each project keeps its memory in `design/chatgpt/`, at the root of the git repository you run from (or `--project DIR`):
+
+```
+design/chatgpt/
+  project.json                     the current session
+  sessions/<date>-<topic>/
+    session.json                   topic, chat URL, every round
+    brief.md
+    shots/
+    rounds/01/                     prompt.txt, response.md, images/, meta.json
+    rounds/02/ ...
+```
+
+Commit it to keep the design history with the code, or add it to `.gitignore`.
+
 ### `shoot`: screenshot a running app
 
 ```sh
-chatgpt-design shoot --base http://localhost:5173 --out jam/shots home=/ 'billing=/settings?tab=billing'
+chatgpt-design shoot --base http://localhost:5173 home=/ 'billing=/settings?tab=billing'
 ```
 
-Each `name=path` becomes `NN-name.png` at 1440×900. Quote arguments that contain `?` or `&`. Flags:
+Each `name=path` becomes `NN-name.png` at 1440×900, in the current session's `shots/` (or `--out DIR`). Quote arguments that contain `?` or `&`. Flags:
 
 | Flag | Default | |
 |---|---|---|
@@ -82,7 +111,7 @@ It uses a throwaway headless profile and never your ChatGPT one.
 ### `ask`: send to ChatGPT
 
 ```sh
-chatgpt-design ask --mode spec --dir jam --goal "fewer setup steps for non-developers"
+chatgpt-design ask --mode spec --goal "fewer setup steps for non-developers"
 ```
 
 | Mode | Gets back |
@@ -92,18 +121,20 @@ chatgpt-design ask --mode spec --dir jam --goal "fewer setup steps for non-devel
 | `logo` | three logo concepts and an app icon; needs no screenshots |
 | `chat` | the answer to any prompt: `--prompt FILE` or `--prompt -` for stdin |
 
-`--dir JAM` reads `JAM/brief.md` and `JAM/shots/*`, and writes to `JAM/chatgpt/`. You can also pass each part yourself:
+`ask` sends to the current session's chat and saves the round in `rounds/NN/`. The first round reads `brief.md` and attaches every image in `shots/`. Later rounds attach only the screenshots you pass with `--shot`, because the chat already has the others.
 
-| Flag | Passes |
+| Flag | |
 |---|---|
-| `--brief` | the brief file |
+| `--new --topic TOPIC` | start a new session, and a new chat, first |
+| `--session ID` | send to another session without switching to it |
+| `--brief` | a brief file other than `SESSION/brief.md` |
 | `--shot` | one screenshot; repeat it for more, up to 10 |
 | `--brand` | a brand sheet |
-| `--out` | the output directory |
+| `--goal` | one line on what this round should optimise for |
 
-`--dry-run` prints the exact prompt and file list without opening Chrome.
+`--dry-run` prints the exact prompt, file list and target chat without opening Chrome or creating anything.
 
-The output directory holds:
+Each round directory holds:
 
 | File | Contents |
 |---|---|
@@ -121,7 +152,7 @@ The output directory holds:
 |---|---|
 | 0 | done |
 | 1 | error, such as Chrome failing to start, the profile being in use, ChatGPT's page having changed, or a time-out |
-| 2 | bad flags or arguments |
+| 2 | bad flags or arguments, or no current session |
 | 3 | not logged in: run `chatgpt-design login` |
 | 4 | ChatGPT usage limit reached |
 
@@ -155,7 +186,7 @@ make          # lint, test, build to bin/chatgpt-design
 make race
 ```
 
-Prompt templates are in `internal/prompt/templates/`, and the ChatGPT page driver is in `internal/browser/chatgpt.go`.
+Prompt templates are in `internal/prompt/templates/`, the ChatGPT page driver is in `internal/browser/chatgpt.go`, and sessions are in `internal/memory/`.
 
 ## License
 

@@ -27,10 +27,30 @@ This skill never writes application code. It produces images and prose, then han
 
 If the mode is unclear, ask.
 
+## Sessions
+
+Everything lives in the project, under `design/chatgpt/`:
+
+```
+design/chatgpt/
+  project.json                     the current session
+  sessions/<date>-<topic>/
+    session.json                   topic, ChatGPT chat URL, every round
+    brief.md, shots/
+    rounds/NN/                     prompt.txt, response.md, images/, meta.json
+```
+
+One session is one ChatGPT chat about one topic. **Every `ask` continues the current session's chat**, so ChatGPT keeps the earlier screenshots and answers in mind. Start a new session only when the user asks for a new session or a new chat, or moves to an unrelated topic. If you are unsure, ask.
+
+- `chatgpt-design session show` prints the current session, its chat and its rounds. Read it before starting, and read earlier `rounds/*/response.md` for context.
+- `chatgpt-design session list` and `chatgpt-design session use ID` switch to an older session.
+
 ## Steps
 
-1. **Jam directory.** Create `design/jams/YYYY-MM-DD-<topic>/` at the repo root.
-2. **Brief.** Write `<jam>/brief.md` in under 400 words with these headings:
+1. **Session.** Run `chatgpt-design session show`.
+   - If it is on this topic, continue in it and skip to step 4 for a follow-up.
+   - Otherwise, or if the user asked for a new session, run `chatgpt-design session new <topic>`. It prints the session directory, `<session>` below.
+2. **Brief.** Write `<session>/brief.md` in under 400 words with these headings:
    - `## Product`
    - `## Users`
    - `## Stack`
@@ -39,32 +59,35 @@ If the mode is unclear, ask.
 
    Describe the product, not the codebase: ChatGPT has no repo access. If `design/brand.md` exists, pass it with `--brand`.
 3. **Screenshots.** Skip this step in `logo` mode.
-   - With the app running, capture 4 to 6 key screens:
+   - With the app running, capture 4 to 6 key screens into the session:
 
      ```
-     chatgpt-design shoot --base http://localhost:3000 --out <jam>/shots overview=/ 'settings=/settings?tab=team'
+     chatgpt-design shoot --base http://localhost:3000 overview=/ 'settings=/settings?tab=team'
      ```
 
-   - Each `name=path` argument becomes `NN-name.png` at 1440×900. Quote any argument with `?` or `&`, because zsh expands them. Add `--full` for whole pages.
-   - Or drop existing images into `<jam>/shots/`.
-4. **Confirm.** This step is mandatory. Run `chatgpt-design ask --mode <mode> --dir <jam> --dry-run` to print the exact prompt and file list. Show the user these four things:
-   - the brief
+   - Each `name=path` argument becomes `<session>/shots/NN-name.png` at 1440×900. Quote any argument with `?` or `&`, because zsh expands them. Add `--full` for whole pages.
+   - Or drop existing images into `<session>/shots/`.
+   - The first round attaches every shot in `shots/`. Follow-up rounds attach only the `--shot` files you pass, because the chat already has the rest.
+4. **Confirm.** This step is mandatory. Run `chatgpt-design ask --mode <mode> --dry-run` (same flags as the real run) to print the exact prompt, the file list and the chat it goes to. Show the user these things:
+   - the brief, or the follow-up prompt
    - the list of screenshots
    - a warning that screenshots of a logged-in app often show real personal or customer data, so they should look first
-   - that everything goes to their ChatGPT account
+   - that everything goes to their ChatGPT account, in the session's chat
 
    Wait for a clear yes. Nothing leaves the machine before this.
 5. **Send.**
 
    ```
-   chatgpt-design ask --mode <mode> --dir <jam> [--brand design/brand.md] [--goal "one line on what to optimise for"]
+   chatgpt-design ask --mode <mode> [--shot FILE ...] [--brand design/brand.md] [--goal "one line on what to optimise for"]
+   chatgpt-design ask --mode chat --prompt FILE      # a follow-up in your own words
    ```
 
    - The command opens a Chrome window. Tell the user not to touch it.
    - `redesign` and `logo` can take 5 to 15 minutes. Use a long timeout or run it in the background.
-   - Output goes to `<jam>/chatgpt/`: `response.md`, `images/NN.png`, `prompt.txt`, and `meta.json` with the chat URL.
-6. **Review.** Read `response.md` and look at every image. Summarise ChatGPT's direction in a few lines, list the image paths, and give the chat URL for follow-ups.
-   - If ChatGPT returned fewer mockups than screens, run the command again with `--mode chat` and a prompt asking for the missing ones.
+   - Output goes to `<session>/rounds/NN/`: `response.md`, `images/NN.png`, `prompt.txt`, `meta.json`. The session records the round and the chat URL.
+   - `--new --topic TOPIC` starts a new session and sends in one step. `--session ID` sends to another session without switching.
+6. **Review.** Read `response.md` and look at every image. Summarise ChatGPT's direction in a few lines, list the image paths, and give the chat URL.
+   - If ChatGPT returned fewer mockups than screens, send a follow-up with `--mode chat` asking for the missing ones. It lands in the same chat.
 7. **Hand off.** Ask which direction the user wants. Implementing it is a separate task, with the `impeccable` skill if it is installed, or as normal frontend work.
 
 ## Failures
@@ -74,7 +97,9 @@ If the mode is unclear, ask.
 | 3 | `not logged in` | The user runs `chatgpt-design login`. |
 | 4 | `usage limit` | Report it. Retry later or switch the ChatGPT model in the browser. |
 | 1 | `the profile is in use` | Another run or the login window is still open. Close it. |
-| 1 | `no file input` / `send button` / `composer took` | ChatGPT changed its page. Report it with `<jam>/chatgpt/error.png`. Do not retry more than twice. |
+| 1 | `no file input` / `send button` / `composer took` | ChatGPT changed its page. Report it with `<session>/rounds/NN/error.png`. Do not retry more than twice. |
+| 1 | `conversation did not open` | The session's chat was deleted or belongs to another account. Ask the user, then start a new session. |
+| 2 | `no current session` | Run `chatgpt-design session new <topic>` first. |
 | 1 | `timed out` | Open the chat URL in `error.png` or `meta.json`. ChatGPT may have asked a question. |
 
 Never type the user's ChatGPT password and never handle their cookies. The CLI keeps the session in its own Chrome profile and never prints it.

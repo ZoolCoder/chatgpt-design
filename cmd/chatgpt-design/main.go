@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/zoolcoder/chatgpt-design/internal/browser"
+	"github.com/zoolcoder/chatgpt-design/internal/memory"
 	"github.com/zoolcoder/chatgpt-design/internal/output"
 	"github.com/zoolcoder/chatgpt-design/internal/prompt"
 	"github.com/zoolcoder/chatgpt-design/skill"
@@ -30,6 +31,7 @@ const (
 	exitLimit    = 4
 	maxShots     = 10
 	maxShotBytes = 20 << 20
+	maxTextBytes = 256 << 10
 )
 
 const usage = `chatgpt-design: send screenshots and a design prompt to your own ChatGPT, save the answer.
@@ -37,12 +39,15 @@ const usage = `chatgpt-design: send screenshots and a design prompt to your own 
 Usage:
   chatgpt-design login                      sign in once, in a dedicated Chrome profile
   chatgpt-design status                     say whether that profile is signed in
-  chatgpt-design shoot --base URL --out DIR name=/path ...
-                                            screenshot pages of a running app
-  chatgpt-design ask --mode MODE --dir JAM  send JAM/brief.md and JAM/shots/*, save to JAM/chatgpt/
+  chatgpt-design session new TOPIC          start a session: a new ChatGPT chat, files in design/chatgpt/
+  chatgpt-design session show|list|use ID   see or switch the project's sessions
+  chatgpt-design shoot --base URL name=/path ...
+                                            screenshot pages of a running app into the session
+  chatgpt-design ask --mode MODE            send to the session's chat, save the round in the session
   chatgpt-design install-skill              install the agent skill for Claude Code, Codex and others
   chatgpt-design version
 
+Every ask continues the current session's ChatGPT chat until you start a new session.
 Modes: spec (written critique and tokens), redesign (mockup images), logo, chat (--prompt FILE).
 Run "chatgpt-design <command> -h" for flags.
 `
@@ -55,7 +60,7 @@ func main() {
 		os.Exit(exitUsage)
 	}
 	cmds := map[string]func(context.Context, []string) error{
-		"login": login, "status": status, "shoot": shoot, "ask": ask, "install-skill": installSkill,
+		"login": login, "status": status, "session": session, "shoot": shoot, "ask": ask, "install-skill": installSkill,
 	}
 	name, args := os.Args[1], os.Args[2:]
 	switch name {
@@ -85,7 +90,7 @@ type usageError struct{ error }
 func exitCode(err error) int {
 	var ue usageError
 	switch {
-	case errors.As(err, &ue):
+	case errors.As(err, &ue), errors.Is(err, memory.ErrNoSession):
 		return exitUsage
 	case errors.Is(err, browser.ErrNotLoggedIn):
 		return exitLogin
@@ -154,7 +159,8 @@ func openProfile(ctx context.Context, headless bool) (context.Context, context.C
 func shoot(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("shoot", flag.ContinueOnError)
 	base := fs.String("base", "", "app URL, e.g. http://localhost:3000")
-	out := fs.String("out", "", "directory for NN-name.png files")
+	out := fs.String("out", "", "directory for NN-name.png files (default: the current session's shots/)")
+	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
 	width := fs.Int("width", 1440, "viewport width (at most 1600)")
 	height := fs.Int("height", 900, "viewport height")
 	settle := fs.Duration("wait", 1500*time.Millisecond, "time to let each page settle")
@@ -171,7 +177,15 @@ func shoot(ctx context.Context, args []string) error {
 		return usageError{err}
 	}
 	if *out == "" {
-		return usageError{errors.New("--out is required")}
+		p, err := memory.Open(*project)
+		if err != nil {
+			return err
+		}
+		cur, err := p.Current()
+		if err != nil {
+			return err
+		}
+		*out = filepath.Join(cur.Dir(), "shots")
 	}
 	if *width < 320 || *width > 1600 {
 		return usageError{errors.New("--width must be 320 to 1600")}
@@ -228,45 +242,75 @@ func shotTargets(base string, args []string) ([]target, error) {
 func ask(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	mode := fs.String("mode", "spec", "spec, redesign, logo or chat")
-	dir := fs.String("dir", "", "jam directory: reads brief.md and shots/, writes chatgpt/")
-	briefPath := fs.String("brief", "", "brief file (default JAM/brief.md)")
+	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
+	newSession := fs.Bool("new", false, "start a new session (and a new ChatGPT chat) first; needs --topic")
+	topic := fs.String("topic", "", "topic of the new session, e.g. \"simple onboarding\"")
+	sessionID := fs.String("session", "", "use this session instead of the current one")
+	briefPath := fs.String("brief", "", "brief file (default SESSION/brief.md)")
 	brandPath := fs.String("brand", "", "brand sheet, e.g. design/brand.md")
 	promptPath := fs.String("prompt", "", "your own prompt file, - for stdin (required for chat)")
 	goal := fs.String("goal", "", "one line on what this round should optimise for")
-	out := fs.String("out", "", "output directory (default JAM/chatgpt)")
 	timeout := fs.Duration("timeout", 20*time.Minute, "give up after this long")
 	dry := fs.Bool("dry-run", false, "print the prompt and files, send nothing")
 	var shots multi
-	fs.Var(&shots, "shot", "screenshot to attach (repeatable; default JAM/shots/*)")
+	fs.Var(&shots, "shot", "screenshot to attach (repeatable; the first round defaults to SESSION/shots/*)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return usageError{fmt.Errorf("unexpected argument %q", fs.Arg(0))}
 	}
-	if *dir != "" {
-		if *briefPath == "" {
-			*briefPath = filepath.Join(*dir, "brief.md")
+	if *newSession && *sessionID != "" {
+		return usageError{errors.New("use --new or --session, not both")}
+	}
+	if *newSession && strings.TrimSpace(*topic) == "" {
+		return usageError{errors.New("--new needs --topic")}
+	}
+	if !*newSession && *topic != "" {
+		return usageError{errors.New("--topic works only with --new")}
+	}
+	p, err := memory.Open(*project)
+	if err != nil {
+		return err
+	}
+
+	var sess *memory.Session
+	switch {
+	case *newSession:
+		if *dry {
+			break // a dry run creates nothing
 		}
-		if len(shots) == 0 && *mode != "logo" {
-			found, err := findShots(filepath.Join(*dir, "shots"))
+		if sess, err = p.New(*topic, time.Now()); err != nil {
+			return usageError{err}
+		}
+		logf("new session %s", sess.ID)
+	case *sessionID != "":
+		if sess, err = p.Session(*sessionID); err != nil {
+			return usageError{err}
+		}
+	default:
+		if sess, err = p.Current(); err != nil {
+			return err
+		}
+	}
+
+	firstRound := sess == nil || len(sess.Rounds) == 0
+	if sess != nil {
+		if *briefPath == "" && *mode != "chat" {
+			*briefPath = filepath.Join(sess.Dir(), "brief.md")
+		}
+		if len(shots) == 0 && firstRound && *mode != "logo" && *mode != "chat" {
+			found, err := findShots(filepath.Join(sess.Dir(), "shots"))
 			if err != nil {
 				return err
 			}
 			shots = found
 		}
-		if *out == "" {
-			*out = filepath.Join(*dir, "chatgpt")
-		}
-	}
-	if *out == "" && !*dry {
-		return usageError{errors.New("set --dir or --out")}
 	}
 	files, err := checkShots(shots)
 	if err != nil {
 		return usageError{err}
 	}
-
 	text, err := buildPrompt(*mode, *briefPath, *brandPath, *promptPath, *goal, files)
 	if err != nil {
 		return err
@@ -277,12 +321,18 @@ func ask(ctx context.Context, args []string) error {
 		for _, f := range files {
 			fmt.Println("attach:", f)
 		}
-		if *out != "" {
-			fmt.Println("output:", *out)
+		switch {
+		case sess == nil:
+			fmt.Println("session: new, chat: new")
+		case sess.ChatURL == "":
+			fmt.Printf("session: %s, chat: new\n", sess.ID)
+		default:
+			fmt.Printf("session: %s, chat: %s\n", sess.ID, sess.ChatURL)
 		}
 		return nil
 	}
 
+	out := sess.NextRoundDir()
 	tab, closeTab, err := openProfile(ctx, false)
 	if err != nil {
 		return err
@@ -290,27 +340,32 @@ func ask(ctx context.Context, args []string) error {
 	defer closeTab()
 	res, err := browser.Ask(tab, browser.Request{
 		Prompt:     text,
+		ChatURL:    sess.ChatURL,
 		Files:      files,
 		WantImages: *mode == "redesign" || *mode == "logo",
 		Timeout:    *timeout,
 		Log:        logf,
 	})
 	if err != nil {
-		if mkErr := os.MkdirAll(*out, 0o755); mkErr == nil {
-			shot := filepath.Join(*out, "error.png")
+		if mkErr := os.MkdirAll(out, 0o755); mkErr == nil {
+			shot := filepath.Join(out, "error.png")
 			if browser.Screenshot(tab, shot) == nil {
 				logf("page at failure: %s", shot)
 			}
 		}
 		return err
 	}
-	meta, err := output.Save(*out, text, res, output.Meta{Mode: *mode, Shots: files})
+	meta, err := output.Save(out, text, res, output.Meta{Mode: *mode, Shots: files})
 	if err != nil {
+		return err
+	}
+	if err := sess.AddRound(roundOf(sess.Dir(), out, meta), chatURL(res.URL, sess.ChatURL)); err != nil {
 		return err
 	}
 	for _, w := range meta.Warnings {
 		logf("warning: %s", w)
 	}
+	fmt.Println("session:", sess.ID)
 	fmt.Println("response:", meta.Response)
 	for _, im := range meta.Images {
 		fmt.Println("image:", im)
@@ -319,14 +374,130 @@ func ask(ctx context.Context, args []string) error {
 	return nil
 }
 
+// chatURL keeps the session on the conversation it already has, and adopts the one ChatGPT opened otherwise.
+func chatURL(got, had string) string {
+	if had != "" || !strings.Contains(got, "/c/") {
+		return had
+	}
+	return got
+}
+
+func roundOf(sessDir, out string, m output.Meta) memory.Round {
+	rel := func(p string) string {
+		if r, err := filepath.Rel(sessDir, p); err == nil {
+			return filepath.ToSlash(r)
+		}
+		return p
+	}
+	r := memory.Round{Mode: m.Mode, At: m.Created, Dir: rel(out), Response: rel(m.Response), Warnings: m.Warnings}
+	for _, im := range m.Images {
+		r.Images = append(r.Images, rel(im))
+	}
+	for _, sh := range m.Shots {
+		r.Shots = append(r.Shots, rel(sh))
+	}
+	return r
+}
+
+func session(_ context.Context, args []string) error {
+	fs := flag.NewFlagSet("session", flag.ContinueOnError)
+	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: chatgpt-design session new TOPIC | show [ID] | list | use ID")
+		fs.PrintDefaults()
+	}
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	p, err := memory.Open(*project)
+	if err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		rest = []string{"show"}
+	}
+	switch verb, rest := rest[0], rest[1:]; verb {
+	case "new":
+		if len(rest) == 0 {
+			return usageError{errors.New("session new needs a topic")}
+		}
+		s, err := p.New(strings.Join(rest, " "), time.Now())
+		if err != nil {
+			return usageError{err}
+		}
+		fmt.Println("session:", s.ID)
+		fmt.Println("dir:", s.Dir())
+		return nil
+	case "show":
+		var s *memory.Session
+		if len(rest) > 0 {
+			s, err = p.Session(rest[0])
+		} else {
+			s, err = p.Current()
+		}
+		if err != nil {
+			return err
+		}
+		printSession(s)
+		return nil
+	case "list":
+		all, err := p.List()
+		if err != nil {
+			return err
+		}
+		cur, _ := p.Current()
+		for _, s := range all {
+			mark := " "
+			if cur != nil && cur.ID == s.ID {
+				mark = "*"
+			}
+			fmt.Printf("%s %s  %d round(s)  %s\n", mark, s.ID, len(s.Rounds), s.Topic)
+		}
+		return nil
+	case "use":
+		if len(rest) != 1 {
+			return usageError{errors.New("session use needs one session id")}
+		}
+		if err := p.Use(rest[0]); err != nil {
+			return usageError{err}
+		}
+		fmt.Println("session:", rest[0])
+		return nil
+	default:
+		return usageError{fmt.Errorf("unknown session command %q, want new, show, list or use", verb)}
+	}
+}
+
+func printSession(s *memory.Session) {
+	fmt.Println("session:", s.ID)
+	fmt.Println("topic:", s.Topic)
+	fmt.Println("dir:", s.Dir())
+	chat := s.ChatURL
+	if chat == "" {
+		chat = "none yet (the next ask starts it)"
+	}
+	fmt.Println("chat:", chat)
+	for _, r := range s.Rounds {
+		fmt.Printf("round %02d  %s  %s  %s", r.N, r.At.Local().Format("2006-01-02 15:04"), r.Mode, r.Response)
+		if len(r.Images) > 0 {
+			fmt.Printf("  %d image(s)", len(r.Images))
+		}
+		fmt.Println()
+	}
+}
+
 func buildPrompt(mode, briefPath, brandPath, promptPath, goal string, files []string) (string, error) {
+	if mode != "chat" && !slices.Contains(prompt.Modes, mode) {
+		return "", usageError{fmt.Errorf("unknown mode %q, want one of %s, chat", mode, strings.Join(prompt.Modes, ", "))}
+	}
 	if mode == "chat" {
 		if promptPath == "" {
 			return "", usageError{errors.New("chat mode needs --prompt FILE")}
 		}
 		text, err := readText(promptPath)
 		if err != nil {
-			return "", err
+			return "", usageError{err}
 		}
 		if strings.TrimSpace(text) == "" {
 			return "", usageError{errors.New("the prompt is empty")}
@@ -337,16 +508,16 @@ func buildPrompt(mode, briefPath, brandPath, promptPath, goal string, files []st
 		return "", usageError{errors.New("--prompt works only with --mode chat")}
 	}
 	if briefPath == "" {
-		return "", usageError{errors.New("set --dir or --brief")}
+		return "", usageError{errors.New("no brief: write SESSION/brief.md or pass --brief")}
 	}
 	brief, err := readText(briefPath)
 	if err != nil {
-		return "", err
+		return "", usageError{err}
 	}
 	brand := ""
 	if brandPath != "" {
 		if brand, err = readText(brandPath); err != nil {
-			return "", err
+			return "", usageError{err}
 		}
 	}
 	text, err := prompt.Build(mode, prompt.Input{Brief: brief, Brand: brand, Shots: files, Goal: goal})
@@ -366,8 +537,14 @@ func readText(path string) (string, error) {
 		defer f.Close()
 		r = f
 	}
-	b, err := io.ReadAll(io.LimitReader(r, 256<<10))
-	return string(b), err
+	b, err := io.ReadAll(io.LimitReader(r, maxTextBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxTextBytes {
+		return "", fmt.Errorf("%s: larger than %d KB", path, maxTextBytes>>10)
+	}
+	return string(b), nil
 }
 
 var imageExts = []string{".png", ".jpg", ".jpeg", ".webp", ".gif"}
