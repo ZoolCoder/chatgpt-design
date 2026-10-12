@@ -370,8 +370,8 @@ func waitAnswer(ctx context.Context, r Request) error {
 		if st.ErrMsg != "" && !st.Stop {
 			return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
 		}
-		// An image answer can come without any text turn, so images alone complete it.
-		answered := st.N > 0 && st.Len > 0
+		// An answer can be images alone with no text, in any mode, so new images complete it too.
+		answered := st.N > 0 && st.Len > 0 || st.Imgs > 0
 		if r.WantImages {
 			answered = st.Imgs > 0
 		}
@@ -389,7 +389,10 @@ func waitAnswer(ctx context.Context, r Request) error {
 			if r.WantImages && st.N > 0 && st.Imgs == 0 && !st.Stop {
 				return errors.New("timed out: ChatGPT answered without an image (it may have asked a question instead; open the chat)")
 			}
-			return waitErr(ctx, err)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("timed out waiting for ChatGPT's answer (last seen: %d turn(s), %d chars, %d image(s), stop=%t, busy=%t)", st.N, st.Len, st.Imgs, st.Stop, st.Busy)
+			}
+			return err
 		}
 	}
 }
