@@ -278,6 +278,7 @@ func ask(ctx context.Context, args []string) error {
 	goal := fs.String("goal", "", "one line on what this ask should optimise for")
 	timeout := fs.Duration("timeout", 20*time.Minute, "give up after this long")
 	dry := fs.Bool("dry-run", false, "print the prompt and files, send nothing")
+	collect := fs.Bool("collect", false, "send nothing; save the answer to the chat's last message (rerun a failed ask with the same flags)")
 	var shots multi
 	fs.Var(&shots, "shot", "screenshot to attach (repeatable; a new chat defaults to SESSION/shots/*)")
 	if err := parse(fs, args); err != nil {
@@ -343,6 +344,7 @@ func ask(ctx context.Context, args []string) error {
 		ChatURL:    sess.ChatURL,
 		Files:      files,
 		WantImages: *mode == "redesign" || *mode == "logo",
+		Collect:    *collect,
 		Timeout:    *timeout,
 		Log:        logf,
 	})

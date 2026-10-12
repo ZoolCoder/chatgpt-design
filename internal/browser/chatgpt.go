@@ -32,6 +32,7 @@ type Request struct {
 	ChatURL    string   // continue this conversation; empty starts a new one
 	Files      []string // absolute paths of images to attach
 	WantImages bool     // the answer is not done until it carries an image
+	Collect    bool     // send nothing; wait for and read the answer to the chat's last message
 	Timeout    time.Duration
 	Log        func(format string, args ...any)
 }
@@ -73,13 +74,20 @@ var (
 const selGenerated = "[data-testid=generated-image-gallery] img, [data-testid=generated-image-preview] img"
 
 // js fills a script's placeholders: COMPOSER, SEND and STOP become selector strings; USER_TURNS and
-// ASSISTANT_TURNS become arrays of turn elements; BODIES(t) becomes the answer blocks inside turn t.
+// ASSISTANT_TURNS become arrays of turn elements; NEW_TURNS and NEW_GENERATED keep only what follows
+// the last user turn; BODIES(t) becomes the answer blocks inside turn t.
 func js(src string) string {
 	lit := func(v any) string { b, _ := json.Marshal(v); return string(b) }
 	first := func(root string, sels []string) string {
 		return `((root, sels) => { for (const s of sels) { const n = root.querySelectorAll(s); if (n.length) return [...n]; } return []; })(` + root + `, ` + lit(sels) + `)`
 	}
+	// ChatGPT unmounts old turns in a long chat, so counts are no anchor; the last user turn is.
+	after := func(nodes string) string {
+		return `((nodes) => { const u = ` + first("document", selUserTurns) + `.pop(); return u ? nodes.filter(n => u.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING) : nodes; })(` + nodes + `)`
+	}
 	return strings.NewReplacer(
+		"NEW_TURNS", after(first("document", selAssistantTurns)),
+		"NEW_GENERATED", after(`[...document.querySelectorAll(`+lit(selGenerated)+`)]`),
 		"COMPOSER", lit(selComposer), "SEND", lit(selSend), "STOP", lit(selStop), "GENERATED", lit(selGenerated),
 		"USER_TURNS", first("document", selUserTurns),
 		"ASSISTANT_TURNS", first("document", selAssistantTurns),
@@ -161,6 +169,16 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 		}
 	}
 
+	if r.Collect {
+		if r.ChatURL == "" {
+			return nil, errors.New("nothing to collect: the session has no ChatGPT chat yet")
+		}
+		r.Log("collecting the answer to the last message")
+		if err := waitAnswer(ctx, r); err != nil {
+			return nil, err
+		}
+		return harvest(ctx)
+	}
 	if len(r.Files) > 0 {
 		r.Log("attaching %d file(s)", len(r.Files))
 		if err := attach(ctx, r.Files); err != nil {
@@ -168,10 +186,6 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 		}
 	}
 
-	base, err := eval[baseline](ctx, baselineJS)
-	if err != nil {
-		return nil, err
-	}
 	if err := typePrompt(ctx, r.Prompt); err != nil {
 		return nil, err
 	}
@@ -180,10 +194,10 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 		return nil, err
 	}
 	r.Log("waiting for the answer")
-	if err := waitAnswer(ctx, base, r); err != nil {
+	if err := waitAnswer(ctx, r); err != nil {
 		return nil, err
 	}
-	return harvest(ctx, base)
+	return harvest(ctx)
 }
 
 func attach(ctx context.Context, files []string) error {
@@ -256,32 +270,26 @@ func send(ctx context.Context) error {
 	}); err != nil {
 		return errors.New("the send button never became ready")
 	}
-	users := func() int {
-		n, _ := eval[int](ctx, js(`USER_TURNS.length`))
-		return n
+	// The last user turn changes when the message lands; its count alone does not grow in a long chat.
+	lastUser := func() string {
+		s, _ := eval[string](ctx, js(`(() => { const u = USER_TURNS; const l = u[u.length - 1]; return l ? u.length + ':' + (l.getAttribute('data-message-id') || l.innerText.slice(0, 200)) : ''; })()`))
+		return s
 	}
-	before := users()
+	before := lastUser()
+	sent := func() (bool, error) { return lastUser() != before, nil }
 	if err := chromedp.Do(ctx, chromedp.Click(chromedp.CSS(selSend))); err != nil {
 		return fmt.Errorf("click send: %w", err)
 	}
-	if waitFor(ctx, 15*time.Second, func() (bool, error) { return users() > before, nil }) == nil {
+	if waitFor(ctx, 15*time.Second, sent) == nil {
 		return nil
 	}
 	// A missed click leaves the prompt in the composer; a DOM click is the fallback.
 	_, _ = eval[chromedp.Void](ctx, js(`document.querySelector(SEND)?.click()`))
-	if waitFor(ctx, 15*time.Second, func() (bool, error) { return users() > before, nil }) != nil {
+	if waitFor(ctx, 15*time.Second, sent) != nil {
 		return errors.New("the message was not sent")
 	}
 	return nil
 }
-
-// baseline is what the conversation held before this message, so only newer turns and images count.
-type baseline struct {
-	Turns int `json:"turns"`
-	Gen   int `json:"gen"`
-}
-
-var baselineJS = js(`({ turns: ASSISTANT_TURNS.length, gen: document.querySelectorAll(GENERATED).length })`)
 
 func isChatURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -296,7 +304,7 @@ func waitHistory(ctx context.Context) error {
 		st, err := eval[struct {
 			Turns int  `json:"turns"`
 			Chat  bool `json:"chat"`
-		}](ctx, js(`({ turns: ASSISTANT_TURNS.length, chat: location.pathname.startsWith('/c/') })`))
+		}](ctx, js(`({ turns: USER_TURNS.length + ASSISTANT_TURNS.length, chat: location.pathname.startsWith('/c/') })`))
 		if err != nil {
 			return false, nil
 		}
@@ -327,25 +335,24 @@ type answerState struct {
 	ErrMsg string `json:"err"`
 }
 
-var answerJS = js(`((before, genBase) => {
-  const turns = ASSISTANT_TURNS;
+var answerJS = js(`(() => {
+  const turns = NEW_TURNS;
   const last = turns[turns.length - 1];
   const stop = !!document.querySelector(STOP);
   const page = document.body.innerText;
   const limit = (page.match(/You[’']ve (?:hit|reached) [^.\n]*limit[^.\n]*/i) || [''])[0];
   const err = (page.match(/Something went wrong[^\n]*|There was an error generating a response/i) || [''])[0];
   const big = i => i.complete && (i.naturalWidth || 0) >= 256;
-  const gen = [...document.querySelectorAll(GENERATED)].slice(genBase).filter(big).length;
+  const gen = NEW_GENERATED.filter(big).length;
   const busy = /creating image|generating image|image is being/i.test(page);
-  if (turns.length <= before) return { n: turns.length, stop, len: 0, imgs: gen, busy, limit, err };
+  if (!turns.length) return { n: turns.length, stop, len: 0, imgs: gen, busy, limit, err };
   const scope = last.closest('article') || last;
   const imgs = gen + [...scope.querySelectorAll('img')].filter(big).length;
   return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err };
 })`)
 
-func waitAnswer(ctx context.Context, base baseline, r Request) error {
-	before := base.Turns
-	check := fmt.Sprintf("(%s)(%d, %d)", answerJS, base.Turns, base.Gen)
+func waitAnswer(ctx context.Context, r Request) error {
+	check := "(" + answerJS + ")()"
 	var prev answerState
 	stable := 0
 	need := 3
@@ -364,7 +371,7 @@ func waitAnswer(ctx context.Context, base baseline, r Request) error {
 			return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
 		}
 		// An image answer can come without any text turn, so images alone complete it.
-		answered := st.N > before && st.Len > 0
+		answered := st.N > 0 && st.Len > 0
 		if r.WantImages {
 			answered = st.Imgs > 0
 		}
@@ -379,7 +386,7 @@ func waitAnswer(ctx context.Context, base baseline, r Request) error {
 		}
 		prev = st
 		if err := sleep(ctx, poll); err != nil {
-			if r.WantImages && st.N > before && st.Imgs == 0 && !st.Stop {
+			if r.WantImages && st.N > 0 && st.Imgs == 0 && !st.Stop {
 				return errors.New("timed out: ChatGPT answered without an image (it may have asked a question instead; open the chat)")
 			}
 			return waitErr(ctx, err)
@@ -394,16 +401,16 @@ func waitErr(ctx context.Context, err error) error {
 	return err
 }
 
-func harvest(ctx context.Context, base baseline) (*Result, error) {
+func harvest(ctx context.Context) (*Result, error) {
 	res := &Result{}
-	src := fmt.Sprintf(js(`(() => {
-  const turns = ASSISTANT_TURNS.slice(%d);
+	src := js(`(() => {
+  const turns = NEW_TURNS;
   return {
     html: turns.map(t => BODIES(t).map(b => b.innerHTML).join('\n')).join('\n'),
     text: turns.map(t => t.innerText).join('\n\n'),
     url: location.href,
   };
-})()`), base.Turns)
+})()`)
 	out, err := eval[struct {
 		HTML string `json:"html"`
 		Text string `json:"text"`
@@ -414,10 +421,10 @@ func harvest(ctx context.Context, base baseline) (*Result, error) {
 	}
 	res.HTML, res.Text, res.URL = out.HTML, out.Text, out.URL
 
-	imgJS := fmt.Sprintf(js(`(async () => {
-  const turns = ASSISTANT_TURNS.slice(%d);
+	imgJS := js(`(async () => {
+  const turns = NEW_TURNS;
   const seen = new Set(), out = [];
-  const imgs = [...turns.flatMap(t => [...(t.closest('article') || t).querySelectorAll('img')]), ...[...document.querySelectorAll(GENERATED)].slice(%d)];
+  const imgs = [...turns.flatMap(t => [...(t.closest('article') || t).querySelectorAll('img')]), ...NEW_GENERATED];
   for (const i of imgs) {
     if ((i.naturalWidth || 0) < 256) continue;
     const src = i.currentSrc || i.src;
@@ -431,7 +438,7 @@ func harvest(ctx context.Context, base baseline) (*Result, error) {
     } catch (e) { out.push({ src }); }
   }
   return out;
-})()`), base.Turns, base.Gen)
+})()`)
 	imgs, err := eval[[]struct {
 		Data string `json:"data"`
 		Src  string `json:"src"`
