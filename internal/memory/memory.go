@@ -131,6 +131,19 @@ func (s *Session) Saved() bool {
 // NewChat makes the next ask start a fresh ChatGPT chat in the same session.
 func (s *Session) NewChat() { s.ChatURL = "" }
 
+// Adopt saves the chat the session continues, before any ask has finished, so a broken run can be collected.
+func (s *Session) Adopt(chatURL string, now time.Time) error {
+	if chatURL == "" || chatURL == s.ChatURL {
+		return nil
+	}
+	s.ChatURL = chatURL
+	s.Updated = now.UTC().Truncate(time.Second)
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return err
+	}
+	return writeJSON(filepath.Join(s.dir, "session.json"), s)
+}
+
 // Record counts a finished ask and keeps the chat it continued or started.
 func (s *Session) Record(chatURL string, now time.Time) error {
 	s.Asks++

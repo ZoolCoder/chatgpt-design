@@ -100,6 +100,7 @@ design/chatgpt/<session>/
 | 1 | `conversation did not open` | The session's chat was deleted or belongs to another account. Ask the user, then send with `--new`. |
 | 2 | `no session` | Pass `--session <name>` or set `CHATGPT_DESIGN_SESSION`. |
 | 1 | `timed out` | Open the chat URL from `chatgpt-design session`. ChatGPT may have asked a question. If it is still answering, rerun the same command with `--collect`. |
+| 1 | `the ChatGPT tab closed during the run` | The chat URL is saved as soon as the message lands, so rerun the same command with `--collect`. If the session still has no chat, add `--chat latest`. |
 | 1 | `the message was not sent` | Check `<session>/error.png`. If the prompt shows in the chat, rerun the same command with `--collect` instead of sending again. |
 
 Never type the user's ChatGPT password and never handle their cookies. The CLI keeps the session in its own Chrome profile and never prints it.

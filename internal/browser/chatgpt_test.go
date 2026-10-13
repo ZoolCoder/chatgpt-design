@@ -43,11 +43,12 @@ func TestScriptsHaveNoPlaceholders(t *testing.T) {
 
 func TestIsChatURL(t *testing.T) {
 	for raw, want := range map[string]bool{
-		"https://chatgpt.com/c/6acc070e":       true,
-		"https://chatgpt.com/":                 false,
-		"http://chatgpt.com/c/x":               false,
-		"https://evil.example/c/x":             false,
-		"https://chatgpt.com.evil.example/c/x": false,
+		"https://chatgpt.com/c/6acc070e":                 true,
+		"https://chatgpt.com/":                           false,
+		"https://chatgpt.com/c/local-chatgpt%3A2846511a": false,
+		"http://chatgpt.com/c/x":                         false,
+		"https://evil.example/c/x":                       false,
+		"https://chatgpt.com.evil.example/c/x":           false,
 	} {
 		if got := isChatURL(raw); got != want {
 			t.Errorf("isChatURL(%q) = %v", raw, got)

@@ -278,6 +278,7 @@ func ask(ctx context.Context, args []string) error {
 	goal := fs.String("goal", "", "one line on what this ask should optimise for")
 	timeout := fs.Duration("timeout", 20*time.Minute, "give up after this long")
 	dry := fs.Bool("dry-run", false, "print the prompt and files, send nothing")
+	chat := fs.String("chat", "", "continue this ChatGPT conversation URL, or \"latest\" for the newest in the sidebar (the session adopts it)")
 	collect := fs.Bool("collect", false, "send nothing; save the answer to the chat's last message (rerun a failed ask with the same flags)")
 	var shots multi
 	fs.Var(&shots, "shot", "screenshot to attach (repeatable; a new chat defaults to SESSION/shots/*)")
@@ -302,10 +303,14 @@ func ask(ctx context.Context, args []string) error {
 	if *newChat {
 		sess.NewChat()
 	}
+	if *chat != "" {
+		sess.ChatURL = *chat
+	}
 	if *briefPath == "" && *mode != "chat" {
 		*briefPath = filepath.Join(sess.Dir(), "brief.md")
 	}
-	if len(shots) == 0 && sess.ChatURL == "" && *mode != "logo" && *mode != "chat" {
+	// --collect rebuilds the prompt of the ask it recovers, so it lists the same shots without sending them.
+	if len(shots) == 0 && (sess.ChatURL == "" || *collect) && *mode != "logo" && *mode != "chat" {
 		found, err := findShots(filepath.Join(sess.Dir(), "shots"))
 		if err != nil {
 			return err
@@ -347,8 +352,16 @@ func ask(ctx context.Context, args []string) error {
 		Collect:    *collect,
 		Timeout:    *timeout,
 		Log:        logf,
+		OnChat: func(u string) {
+			if err := sess.Adopt(u, time.Now()); err != nil {
+				logf("warning: could not save the chat URL: %v", err)
+			}
+		},
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			err = errors.New("the ChatGPT tab closed during the run (closed by hand, or Chrome dropped it); if the message was sent, rerun with --collect")
+		}
 		if mkErr := os.MkdirAll(sess.Dir(), 0o755); mkErr == nil {
 			shot := filepath.Join(sess.Dir(), "error.png")
 			if browser.Screenshot(tab, shot) == nil {
@@ -379,7 +392,7 @@ func ask(ctx context.Context, args []string) error {
 
 // chatURL keeps the session on the conversation it already has, and adopts the one ChatGPT opened otherwise.
 func chatURL(got, had string) string {
-	if had != "" || !strings.Contains(got, "/c/") {
+	if had != "" || !strings.Contains(got, "/c/") || strings.Contains(got, "/c/local-") {
 		return had
 	}
 	return got

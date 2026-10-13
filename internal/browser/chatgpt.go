@@ -21,6 +21,9 @@ import (
 // Home is where every run starts a new chat.
 const Home = "https://chatgpt.com/"
 
+// Latest stands for the newest conversation in the sidebar, for a chat whose URL was never saved.
+const Latest = "latest"
+
 const (
 	poll         = 2 * time.Second
 	maxImageSize = 50 << 20
@@ -29,10 +32,11 @@ const (
 // Request is one message to ChatGPT.
 type Request struct {
 	Prompt     string
-	ChatURL    string   // continue this conversation; empty starts a new one
-	Files      []string // absolute paths of images to attach
-	WantImages bool     // the answer is not done until it carries an image
-	Collect    bool     // send nothing; wait for and read the answer to the chat's last message
+	ChatURL    string           // continue this conversation; empty starts a new one
+	Files      []string         // absolute paths of images to attach
+	WantImages bool             // the answer is not done until it carries an image
+	Collect    bool             // send nothing; wait for and read the answer to the chat's last message
+	OnChat     func(url string) // called once the conversation URL is known, before the answer is in
 	Timeout    time.Duration
 	Log        func(format string, args ...any)
 }
@@ -141,7 +145,7 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
 	start := Home
-	if r.ChatURL != "" {
+	if r.ChatURL != "" && r.ChatURL != Latest {
 		if !isChatURL(r.ChatURL) {
 			return nil, fmt.Errorf("%q is not a ChatGPT conversation URL", r.ChatURL)
 		}
@@ -162,6 +166,16 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("open ChatGPT: %w", err)
 	}
+	if r.ChatURL == Latest {
+		u, err := latestChat(ctx)
+		if err != nil {
+			return nil, err
+		}
+		r.ChatURL = u
+		if err := chromedp.Do(ctx, chromedp.Navigate(u)); err != nil {
+			return nil, err
+		}
+	}
 	if r.ChatURL != "" {
 		r.Log("continuing %s", r.ChatURL)
 		if err := waitHistory(ctx); err != nil {
@@ -171,8 +185,9 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 
 	if r.Collect {
 		if r.ChatURL == "" {
-			return nil, errors.New("nothing to collect: the session has no ChatGPT chat yet")
+			return nil, errors.New("nothing to collect: the session has no ChatGPT chat yet (pass --chat URL, or --chat latest for the newest one)")
 		}
+		r.notify(r.ChatURL)
 		r.Log("collecting the answer to the last message")
 		if err := waitAnswer(ctx, r); err != nil {
 			return nil, err
@@ -193,11 +208,56 @@ func Ask(ctx context.Context, r Request) (*Result, error) {
 	if err := send(ctx); err != nil {
 		return nil, err
 	}
+	r.notify(chatOpened(ctx, r.ChatURL))
 	r.Log("waiting for the answer")
 	if err := waitAnswer(ctx, r); err != nil {
 		return nil, err
 	}
 	return harvest(ctx)
+}
+
+func (r Request) notify(url string) {
+	if r.OnChat != nil && url != "" {
+		r.OnChat(url)
+	}
+}
+
+// chatOpened returns the conversation URL once a new chat has one; ChatGPT assigns it shortly after the send.
+func chatOpened(ctx context.Context, had string) string {
+	if had != "" {
+		return had
+	}
+	var u string
+	_ = waitFor(ctx, 2*time.Minute, func() (bool, error) {
+		u, _ = eval[string](ctx, `location.href`)
+		return isChatURL(u), nil
+	})
+	if !isChatURL(u) {
+		return ""
+	}
+	return u
+}
+
+// latestJS takes the first link under the sidebar's "Recents" heading: pinned chats sit above it.
+const latestJS = `(() => {
+  const links = [...document.querySelectorAll('a[href^="/c/"]')];
+  const head = [...document.querySelectorAll('h2, h3, div, span')].find(e => e.children.length === 0 && /^recents$/i.test(e.textContent.trim()));
+  if (!head) return '';
+  const a = links.find(l => head.compareDocumentPosition(l) & Node.DOCUMENT_POSITION_FOLLOWING);
+  return a ? a.href : '';
+})()`
+
+// latestChat reads the newest conversation link from the sidebar.
+func latestChat(ctx context.Context) (string, error) {
+	var u string
+	err := waitFor(ctx, 20*time.Second, func() (bool, error) {
+		u, _ = eval[string](ctx, latestJS)
+		return isChatURL(u), nil
+	})
+	if err != nil {
+		return "", errors.New("no conversation in the ChatGPT sidebar")
+	}
+	return u, nil
 }
 
 func attach(ctx context.Context, files []string) error {
@@ -211,23 +271,38 @@ func attach(ctx context.Context, files []string) error {
   el.setAttribute('data-cgd-upload', '1');
   return true;
 })()`
-	if ok, err := eval[bool](ctx, pick); err != nil || !ok {
-		return errors.New("ChatGPT has no file input here: the page layout changed or uploads are off for this account")
-	}
-	if err := chromedp.Do(ctx, chromedp.SetUploadFiles(chromedp.CSS(`input[data-cgd-upload]`), files)); err != nil {
-		return fmt.Errorf("attach files: %w", err)
-	}
 	uploads := js(`(() => {
   const form = document.querySelector(COMPOSER)?.closest('form') || document.body;
   const imgs = [...form.querySelectorAll('img')].filter(i => i.complete && i.naturalWidth > 0).length;
   const busy = !!form.querySelector('[role="progressbar"], .animate-spin, circle[stroke-dasharray]');
   return { imgs, busy };
 })()`)
+	type state struct {
+		Imgs int  `json:"imgs"`
+		Busy bool `json:"busy"`
+	}
+	// ChatGPT re-renders the composer while the page settles, and files set on the input it dropped
+	// never show up. No preview at all after a short wait means that happened, so pick the input again.
+	for try := 1; ; try++ {
+		if ok, err := eval[bool](ctx, pick); err != nil || !ok {
+			return errors.New("ChatGPT has no file input here: the page layout changed or uploads are off for this account")
+		}
+		if err := chromedp.Do(ctx, chromedp.SetUploadFiles(chromedp.CSS(`input[data-cgd-upload]`), files)); err != nil {
+			return fmt.Errorf("attach files: %w", err)
+		}
+		landed := waitFor(ctx, 20*time.Second, func() (bool, error) {
+			st, err := eval[state](ctx, uploads)
+			return err == nil && (st.Imgs > 0 || st.Busy), nil
+		})
+		if landed == nil {
+			break
+		}
+		if try == 3 {
+			return errors.New("the attached files never showed in the composer")
+		}
+	}
 	return waitFor(ctx, 3*time.Minute, func() (bool, error) {
-		st, err := eval[struct {
-			Imgs int  `json:"imgs"`
-			Busy bool `json:"busy"`
-		}](ctx, uploads)
+		st, err := eval[state](ctx, uploads)
 		if err != nil {
 			return false, nil
 		}
@@ -293,7 +368,9 @@ func send(ctx context.Context) error {
 
 func isChatURL(raw string) bool {
 	u, err := url.Parse(raw)
-	return err == nil && u.Scheme == "https" && (u.Host == "chatgpt.com" || u.Host == "chat.openai.com") && strings.HasPrefix(u.Path, "/c/")
+	// A new chat first shows a client-side id (/c/local-chatgpt:…) that no other tab can open.
+	return err == nil && u.Scheme == "https" && (u.Host == "chatgpt.com" || u.Host == "chat.openai.com") &&
+		strings.HasPrefix(u.Path, "/c/") && !strings.HasPrefix(u.Path, "/c/local-")
 }
 
 // waitHistory waits until a continued conversation shows its earlier turns and stops growing.

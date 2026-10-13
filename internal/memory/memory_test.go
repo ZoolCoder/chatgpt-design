@@ -78,3 +78,22 @@ func TestSessionID(t *testing.T) {
 		}
 	}
 }
+
+func TestAdoptSavesChatBeforeAnyAsk(t *testing.T) {
+	p := &Project{Root: t.TempDir()}
+	now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	s, err := p.Session("broken-run", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Adopt("https://chatgpt.com/c/xyz", now); err != nil {
+		t.Fatal(err)
+	}
+	again, err := p.Session("broken-run", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ChatURL != "https://chatgpt.com/c/xyz" || again.Asks != 0 {
+		t.Fatalf("after adopt: chat %q, asks %d", again.ChatURL, again.Asks)
+	}
+}

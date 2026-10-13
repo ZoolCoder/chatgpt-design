@@ -125,6 +125,7 @@ chatgpt-design ask --mode spec --goal "fewer setup steps for non-developers"
 |---|---|
 | `--new` | start a new ChatGPT chat in this session |
 | `--collect` | send nothing; save the answer to the chat's last message. Rerun a failed or timed-out ask with the same flags plus `--collect` |
+| `--chat URL\|latest` | continue that conversation and save it in the session; `latest` is the newest chat under Recents in the sidebar (pinned chats are skipped) |
 | `--session ID` | use this session instead of the agent's |
 | `--brief` | a brief file other than `SESSION/brief.md` |
 | `--shot` | one screenshot; repeat it for more, up to 10 |
