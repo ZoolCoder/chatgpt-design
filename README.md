@@ -38,11 +38,13 @@ Prebuilt binaries for macOS, Linux and Windows are on the [releases page](https:
 
 ```sh
 chatgpt-design login           # opens Chrome, you sign in to chatgpt.com; Chrome stays open for later runs
-chatgpt-design status          # prints: logged in
+chatgpt-design doctor          # checks Chrome, the profile, the sign-in and the skill
 chatgpt-design install-skill   # adds the skill for Claude Code, Codex and other agents
 ```
 
-`install-skill` writes `SKILL.md` to `~/.claude/skills/chatgpt-design/`, `~/.codex/skills/chatgpt-design/` and `~/.agents/skills/chatgpt-design/`. To install into a project or another agent, pass one or more `--dir` flags.
+`doctor` prints one line per check and a fix under each failure. `--offline` skips the checks that open Chrome. Its exit code is the first failure's, so `3` means sign in.
+
+`install-skill` writes `SKILL.md` to `skills/chatgpt-design/` in each of `~/.claude`, `~/.codex` and `~/.agents` that exists, or to `~/.claude` when none does. To install into a project or another agent, pass one or more `--dir` flags.
 
 ## Use it from an agent
 
@@ -64,7 +66,7 @@ The skill takes the agent through each step:
 
 The skill never writes application code. Implementing the chosen direction is a separate step.
 
-In Claude Code, run the login with `! chatgpt-design login`, so it runs in your session. Run the CLI outside the agent's command sandbox, because it starts Chrome and talks to chatgpt.com.
+In Claude Code, run the login with `! chatgpt-design login`, so it runs in your session. Run the CLI outside the agent's command sandbox, because it starts Chrome and talks to it on 127.0.0.1. Inside a sandbox it stops with `a command sandbox blocks localhost` and never starts a second Chrome.
 
 ## Commands
 
@@ -96,13 +98,15 @@ Commit it to keep the design history with the code, or add it to `.gitignore`.
 chatgpt-design shoot --base http://localhost:5173 home=/ 'billing=/settings?tab=billing'
 ```
 
-Each `name=path` becomes `NN-name.png` at 1440×900, in the current session's `shots/` (or `--out DIR`). Quote arguments that contain `?` or `&`. Flags:
+Each `name=path` becomes `NN-name.png` at 1440×900, in the current session's `shots/` (or `--out DIR`). Shooting a name again replaces its file and keeps its number; a new name takes the next number. Quote arguments that contain `?` or `&`. A page that answers with HTTP 400 or more fails the run. Flags:
 
 | Flag | Default | |
 |---|---|---|
 | `--width`, `--height` | 1440, 900 | viewport, width 320–1600 |
-| `--wait` | 1.5s | settle time after load |
+| `--wait` | 1.5s | extra settle time once the page and its fonts load |
 | `--full` | off | whole page instead of the viewport |
+| `--mobile` | off | a phone: 390×844 at 3x, touch, mobile user agent |
+| `--dark` | off | `prefers-color-scheme: dark` |
 
 It uses a throwaway headless profile and never your ChatGPT one.
 
@@ -143,11 +147,13 @@ The session folder holds:
 | `session.json` | chat URL, start time, number of asks |
 | `error.png` | a screenshot of the page when a run fails |
 
-`redesign` and `logo` can take 5 to 15 minutes. The default `--timeout` is 20m.
+`redesign` and `logo` can take 5 to 15 minutes. The default `--timeout` is 20m. While it waits, `ask` prints its progress to stderr every 30 seconds. When ChatGPT shows "Something went wrong" with a retry button, `ask` clicks it once before it gives up.
+
+One ask runs per session at a time: a second one fails at once with `session ... is busy`.
 
 ### `browser stop`: quit the background Chrome
 
-The first command starts Chrome on the tool's profile and leaves it running. Every later run attaches to it, opens one tab and closes only that tab, so you stay signed in, nothing reloads from cold, and Chrome never sees an unclean shutdown. Leave the window alone during a run. `chatgpt-design browser stop` quits it cleanly.
+The first command starts Chrome on the tool's profile and leaves it running. Every later run attaches to it, opens one tab and closes only that tab, so you stay signed in, nothing reloads from cold, and Chrome never sees an unclean shutdown. Commands started together share that one Chrome: only one of them starts it. Leave the window alone during a run. `chatgpt-design browser stop` quits it cleanly. On macOS and Linux it also ends a Chrome that holds the port but no longer answers; it only ever ends a process that is Chrome.
 
 ### Exit codes
 
@@ -158,6 +164,10 @@ The first command starts Chrome on the tool's profile and leaves it running. Eve
 | 2 | bad flags or arguments, or no current session |
 | 3 | not logged in: run `chatgpt-design login` |
 | 4 | ChatGPT usage limit reached |
+
+### `--json`
+
+`doctor`, `status`, `session`, `shoot` and `ask` (also with `--dry-run`) print their result as JSON on stdout with `--json`. Logs stay on stderr. On failure they print `{"ok": false, "error": "...", "exit": N}` and exit with `N`.
 
 ## Privacy and safety
 
@@ -179,7 +189,7 @@ The first command starts Chrome on the tool's profile and leaves it running. Eve
 
 - This tool automates the chatgpt.com web page. When OpenAI changes that page, a step can break. The tool fails loudly with `error.png` rather than guessing. Please open an issue with the message.
 - Automating a consumer web app may conflict with its terms of use. It is your account: use the tool for your own work, at a human pace.
-- One run at a time per profile, because Chrome locks the profile directory.
+- Runs at the same time share one Chrome, each in its own tab. Only one ask runs per session at a time.
 - Set `CHATGPT_DESIGN_CHROME` to the browser binary if Chrome is not found.
 
 ## Develop

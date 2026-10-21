@@ -50,8 +50,19 @@ func TestIsChatURL(t *testing.T) {
 		"https://evil.example/c/x":                       false,
 		"https://chatgpt.com.evil.example/c/x":           false,
 	} {
-		if got := isChatURL(raw); got != want {
-			t.Errorf("isChatURL(%q) = %v", raw, got)
+		if got := IsChatURL(raw); got != want {
+			t.Errorf("IsChatURL(%q) = %v", raw, got)
 		}
+	}
+}
+
+func TestMobileUA(t *testing.T) {
+	got := mobileUA("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+	want := "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36"
+	if got != want {
+		t.Errorf("mobileUA = %q", got)
+	}
+	if again := mobileUA(want); again != want {
+		t.Errorf("not idempotent: %q", again)
 	}
 }

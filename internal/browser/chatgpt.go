@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
@@ -25,9 +28,15 @@ const Home = "https://chatgpt.com/"
 const Latest = "latest"
 
 const (
-	poll         = 2 * time.Second
+	poll         = time.Second
+	heartbeat    = 30 * time.Second
+	retryGrace   = 20 * time.Second // how long ChatGPT's retry may take to clear its error
+	nothingYet   = 15 * time.Second // how long --collect waits for an answer to start
 	maxImageSize = 50 << 20
 )
+
+// ErrUsageLimit means ChatGPT refused the message because the account hit a usage limit.
+var ErrUsageLimit = errors.New("ChatGPT usage limit")
 
 // Request is one message to ChatGPT.
 type Request struct {
@@ -79,7 +88,8 @@ const selGenerated = "[data-testid=generated-image-gallery] img, [data-testid=ge
 
 // js fills a script's placeholders: COMPOSER, SEND and STOP become selector strings; USER_TURNS and
 // ASSISTANT_TURNS become arrays of turn elements; NEW_TURNS and NEW_GENERATED keep only what follows
-// the last user turn; BODIES(t) becomes the answer blocks inside turn t.
+// the last user turn; LAST_USER is that turn; BODIES(t) becomes the answer blocks inside turn t;
+// NOT_ANSWER matches user turns and the composer, ANSWER_BODY the answer blocks.
 func js(src string) string {
 	lit := func(v any) string { b, _ := json.Marshal(v); return string(b) }
 	first := func(root string, sels []string) string {
@@ -92,6 +102,10 @@ func js(src string) string {
 	return strings.NewReplacer(
 		"NEW_TURNS", after(first("document", selAssistantTurns)),
 		"NEW_GENERATED", after(`[...document.querySelectorAll(`+lit(selGenerated)+`)]`),
+		"NOT_ANSWER", lit(strings.Join(append(slices.Clone(selUserTurns), selComposer), ", ")),
+		"ANSWER_BODY", lit(strings.Join(selAnswerBody, ", ")),
+		"LAST_USER", first("document", selUserTurns)+".pop()",
+		"MAX_IMAGE", strconv.Itoa(maxImageSize),
 		"COMPOSER", lit(selComposer), "SEND", lit(selSend), "STOP", lit(selStop), "GENERATED", lit(selGenerated),
 		"USER_TURNS", first("document", selUserTurns),
 		"ASSISTANT_TURNS", first("document", selAssistantTurns),
@@ -142,11 +156,14 @@ func Login(ctx context.Context, timeout time.Duration, log func(string, ...any))
 
 // Ask sends one message in a new chat and waits for the full answer.
 func Ask(ctx context.Context, r Request) (*Result, error) {
+	if r.Timeout <= 0 {
+		return nil, errors.New("the timeout must be positive")
+	}
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
 	start := Home
 	if r.ChatURL != "" && r.ChatURL != Latest {
-		if !isChatURL(r.ChatURL) {
+		if !IsChatURL(r.ChatURL) {
 			return nil, fmt.Errorf("%q is not a ChatGPT conversation URL", r.ChatURL)
 		}
 		start = r.ChatURL
@@ -230,9 +247,9 @@ func chatOpened(ctx context.Context, had string) string {
 	var u string
 	_ = waitFor(ctx, 2*time.Minute, func() (bool, error) {
 		u, _ = eval[string](ctx, `location.href`)
-		return isChatURL(u), nil
+		return IsChatURL(u), nil
 	})
-	if !isChatURL(u) {
+	if !IsChatURL(u) {
 		return ""
 	}
 	return u
@@ -252,7 +269,7 @@ func latestChat(ctx context.Context) (string, error) {
 	var u string
 	err := waitFor(ctx, 20*time.Second, func() (bool, error) {
 		u, _ = eval[string](ctx, latestJS)
-		return isChatURL(u), nil
+		return IsChatURL(u), nil
 	})
 	if err != nil {
 		return "", errors.New("no conversation in the ChatGPT sidebar")
@@ -366,7 +383,8 @@ func send(ctx context.Context) error {
 	return nil
 }
 
-func isChatURL(raw string) bool {
+// IsChatURL reports whether raw is a ChatGPT conversation another tab can open.
+func IsChatURL(raw string) bool {
 	u, err := url.Parse(raw)
 	// A new chat first shows a client-side id (/c/local-chatgpt:…) that no other tab can open.
 	return err == nil && u.Scheme == "https" && (u.Host == "chatgpt.com" || u.Host == "chat.openai.com") &&
@@ -410,58 +428,106 @@ type answerState struct {
 	Busy   bool   `json:"busy"`
 	Limit  string `json:"limit"`
 	ErrMsg string `json:"err"`
+	Retry  bool   `json:"retry"`
 }
 
+// answerJS reads only what follows the last user turn, so text in earlier turns never reads as a
+// limit or an error. Limits, errors and progress notes must also sit outside the answer, which may
+// well quote them; only a near-empty answer counts as an image-progress placeholder.
 var answerJS = js(`(() => {
   const turns = NEW_TURNS;
   const last = turns[turns.length - 1];
   const stop = !!document.querySelector(STOP);
-  const page = document.body.innerText;
-  const limit = (page.match(/You[’']ve (?:hit|reached) [^.\n]*limit[^.\n]*/i) || [''])[0];
-  const err = (page.match(/Something went wrong[^\n]*|There was an error generating a response/i) || [''])[0];
+  const u = LAST_USER;
+  const isNew = n => !u || (u.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING);
+  let body = '', outside = '';
+  const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  // Start at the last user turn: in a long chat the earlier turns are most of the page.
+  if (u) w.currentNode = u;
+  for (let n; (n = w.nextNode());) {
+    const p = n.parentElement;
+    // Hidden nodes hold templates such as "{active_limit}", never a message on screen.
+    if (!p || p.closest(NOT_ANSWER) || !p.checkVisibility()) continue;
+    if (p.closest(ANSWER_BODY)) body += n.nodeValue + '\n';
+    else outside += n.nodeValue + '\n';
+  }
+  const limit = (outside.match(/You[’']ve (?:hit|reached) [^.\n{]*limit[^.\n{]*(?![^.\n]*\{)/i) || [''])[0];
+  const err = (outside.match(/Something went wrong[^\n]*|There was an error generating a response/i) || [''])[0];
+  const retry = [...document.querySelectorAll('button')].some(b => isNew(b) && /^(retry|try again|regenerate)$/i.test(b.innerText.trim()));
   const big = i => i.complete && (i.naturalWidth || 0) >= 256;
   const gen = NEW_GENERATED.filter(big).length;
-  const busy = /creating image|generating image|image is being/i.test(page);
-  if (!turns.length) return { n: turns.length, stop, len: 0, imgs: gen, busy, limit, err };
+  const progress = /creating image|generating image|image is being/i;
+  const busy = progress.test(outside) || (body.trim().length < 80 && progress.test(body));
+  if (!turns.length) return { n: 0, stop, len: 0, imgs: gen, busy, limit, err, retry };
   const scope = last.closest('article') || last;
   const imgs = gen + [...scope.querySelectorAll('img')].filter(big).length;
-  return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err };
+  return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err, retry };
 })`)
+
+// retryJS clicks ChatGPT's own retry button under the failed answer.
+var retryJS = js(`(() => {
+  const u = LAST_USER;
+  const b = [...document.querySelectorAll('button')].find(b => (!u || (u.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)) && /^(retry|try again|regenerate)$/i.test(b.innerText.trim()));
+  if (b) b.click();
+  return !!b;
+})()`)
 
 func waitAnswer(ctx context.Context, r Request) error {
 	check := "(" + answerJS + ")()"
-	var prev answerState
-	stable := 0
-	need := 3
+	// The answer must hold still this long: images keep loading after the text has stopped.
+	settle := 4 * time.Second
 	if r.WantImages {
-		need = 5
+		settle = 8 * time.Second
 	}
+	var prev answerState
+	var still time.Time
+	start := time.Now()
+	beat := start.Add(heartbeat)
+	var retried time.Time
 	for {
 		st, err := eval[answerState](ctx, check)
 		if err != nil {
 			return waitErr(ctx, err)
 		}
 		if st.Limit != "" {
-			return fmt.Errorf("ChatGPT usage limit: %s", st.Limit)
+			return fmt.Errorf("%w: %s", ErrUsageLimit, st.Limit)
 		}
-		if st.ErrMsg != "" && !st.Stop {
+		switch {
+		case st.ErrMsg == "" || st.Stop:
+		case !retried.IsZero() && time.Since(retried) < retryGrace:
+			// The old error stays on screen until the retry gets going.
+		case !retried.IsZero() || !st.Retry:
 			return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
+		default:
+			r.Log("ChatGPT failed (%s): retrying once", st.ErrMsg)
+			if ok, err := eval[bool](ctx, retryJS); err != nil || !ok {
+				return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
+			}
+			retried, prev, still = time.Now(), answerState{}, time.Time{}
+		}
+		if r.Collect && st.N == 0 && st.Imgs == 0 && !st.Stop && !st.Busy && time.Since(start) > nothingYet {
+			return errors.New("nothing to collect: the chat's last message has no answer; send it again without --collect")
 		}
 		// An answer can be images alone with no text, in any mode, so new images complete it too.
 		answered := st.N > 0 && st.Len > 0 || st.Imgs > 0
 		if r.WantImages {
 			answered = st.Imgs > 0
 		}
-		done := answered && !st.Stop && !st.Busy
-		if done && st.Len == prev.Len && st.Imgs == prev.Imgs {
-			stable++
-		} else {
-			stable = 0
-		}
-		if stable >= need {
+		// An error still on screen is never a finished answer, even while a retry starts.
+		done := answered && !st.Stop && !st.Busy && st.ErrMsg == ""
+		switch {
+		case !done || st.Len != prev.Len || st.Imgs != prev.Imgs:
+			still = time.Time{}
+		case still.IsZero():
+			still = time.Now()
+		case time.Since(still) >= settle:
 			return nil
 		}
 		prev = st
+		if now := time.Now(); now.After(beat) {
+			r.Log("still waiting (%s): %d chars, %d image(s)%s", now.Sub(start).Round(time.Second), st.Len, st.Imgs, activity(st))
+			beat = now.Add(heartbeat)
+		}
 		if err := sleep(ctx, poll); err != nil {
 			if r.WantImages && st.N > 0 && st.Imgs == 0 && !st.Stop {
 				return errors.New("timed out: ChatGPT answered without an image (it may have asked a question instead; open the chat)")
@@ -472,6 +538,16 @@ func waitAnswer(ctx context.Context, r Request) error {
 			return err
 		}
 	}
+}
+
+func activity(st answerState) string {
+	switch {
+	case st.Busy:
+		return ", making an image"
+	case st.Stop:
+		return ", writing"
+	}
+	return ""
 }
 
 func waitErr(ctx context.Context, err error) error {
@@ -503,21 +579,18 @@ func harvest(ctx context.Context) (*Result, error) {
 
 	imgJS := js(`(async () => {
   const turns = NEW_TURNS;
-  const seen = new Set(), out = [];
   const imgs = [...turns.flatMap(t => [...(t.closest('article') || t).querySelectorAll('img')]), ...NEW_GENERATED];
-  for (const i of imgs) {
-    if ((i.naturalWidth || 0) < 256) continue;
-    const src = i.currentSrc || i.src;
-    if (!src || seen.has(src)) continue;
-    seen.add(src);
+  const srcs = [...new Set(imgs.filter(i => (i.naturalWidth || 0) >= 256).map(i => i.currentSrc || i.src).filter(Boolean))];
+  // Fetch in parallel, keep the page's order.
+  return Promise.all(srcs.map(async src => {
     try {
       const r = await fetch(src, { credentials: 'include' });
       if (!r.ok) throw new Error(String(r.status));
       const b = await r.blob();
-      out.push({ data: await new Promise((ok, no) => { const f = new FileReader(); f.onload = () => ok(f.result); f.onerror = no; f.readAsDataURL(b); }) });
-    } catch (e) { out.push({ src }); }
-  }
-  return out;
+      if (b.size > MAX_IMAGE) throw new Error('too big');
+      return { data: await new Promise((ok, no) => { const f = new FileReader(); f.onload = () => ok(f.result); f.onerror = no; f.readAsDataURL(b); }) };
+    } catch (e) { return { src }; }
+  }));
 })()`)
 	imgs, err := eval[[]struct {
 		Data string `json:"data"`
@@ -630,17 +703,49 @@ func Screenshot(ctx context.Context, path string) error {
 	return os.WriteFile(path, buf, 0o644)
 }
 
-// Shot captures a page at width x height: the viewport, or the whole page when full is set.
-func Shot(ctx context.Context, url string, width, height int, settle time.Duration, full bool) ([]byte, error) {
+// ShotOptions sets up one screenshot.
+type ShotOptions struct {
+	Width, Height int
+	Settle        time.Duration // extra wait once the page and its fonts have loaded
+	Full          bool          // the whole page, not just the viewport
+	Mobile        bool          // a phone: touch, 3x pixels, mobile user agent
+	Dark          bool          // prefers-color-scheme: dark
+}
+
+// Shot captures a page. It fails on an HTTP error status, since a picture of an error page is no
+// use to a design review.
+func Shot(ctx context.Context, url string, o ShotOptions) ([]byte, error) {
+	scheme := "light"
+	if o.Dark {
+		scheme = "dark"
+	}
+	var vp []chromedp.EmulateViewportOption
+	if o.Mobile {
+		vp = append(vp, chromedp.EmulateScale(3), chromedp.EmulateMobile, chromedp.EmulateTouch)
+	}
 	if err := chromedp.Do(ctx,
-		chromedp.EmulateViewport(int64(width), int64(height)),
+		chromedp.EmulateViewport(int64(o.Width), int64(o.Height), vp...),
+		chromedp.Func(func(ctx context.Context, t *chromedp.Target) error {
+			_, err := cdp.Call(ctx, t, emulation.SetEmulatedMedia, emulation.SetEmulatedMediaParams{
+				Features: []*emulation.MediaFeature{{Name: "prefers-color-scheme", Value: scheme}},
+			})
+			return err
+		}),
 		chromedp.Navigate(url),
-		chromedp.WaitReady(chromedp.CSS("body")),
-		chromedp.Sleep(settle),
 	); err != nil {
 		return nil, err
 	}
-	if full {
+	status, err := eval[int](ctx, `performance.getEntriesByType('navigation')[0]?.responseStatus || 0`)
+	if err == nil && status >= 400 {
+		return nil, fmt.Errorf("HTTP %d", status)
+	}
+	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	_, _ = eval[bool](fctx, `document.fonts.ready.then(() => true)`, chromedp.EvalAwaitPromise)
+	cancel()
+	if err := sleep(ctx, o.Settle); err != nil {
+		return nil, err
+	}
+	if o.Full {
 		return chromedp.Run(ctx, chromedp.FullScreenshot(100))
 	}
 	return chromedp.Run(ctx, chromedp.CaptureScreenshot())

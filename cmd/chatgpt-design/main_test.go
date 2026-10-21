@@ -2,10 +2,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zoolcoder/chatgpt-design/internal/browser"
 )
 
 func TestShotTargets(t *testing.T) {
@@ -13,7 +16,7 @@ func TestShotTargets(t *testing.T) {
 	if err != nil || len(got) != 2 || got[0].url != "http://localhost:3000/" || got[1].url != "http://localhost:3000/inbox?x=1" {
 		t.Fatalf("%+v %v", got, err)
 	}
-	for _, bad := range [][]string{{"../x=/"}, {"=/"}, {"home"}} {
+	for _, bad := range [][]string{{"../x=/"}, {"=/"}, {"home"}, {"a=/", "a=/b"}} {
 		if _, err := shotTargets("http://x", bad); err == nil {
 			t.Errorf("%v accepted", bad)
 		}
@@ -74,6 +77,45 @@ func TestChatURL(t *testing.T) {
 	} {
 		if got := chatURL(c.got, c.had); got != c.want {
 			t.Errorf("chatURL(%q, %q) = %q, want %q", c.got, c.had, got, c.want)
+		}
+	}
+}
+
+func TestShotPaths(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"01-home.png", "03-pricing.png", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := shotPaths(dir, []string{"pricing", "about", "home", "faq"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"03-pricing.png", "04-about.png", "01-home.png", "05-faq.png"}
+	for i, w := range want {
+		if filepath.Base(got[i]) != w {
+			t.Errorf("shotPaths[%d] = %s, want %s", i, filepath.Base(got[i]), w)
+		}
+	}
+	if got, _ := shotPaths(filepath.Join(dir, "missing"), []string{"home"}); filepath.Base(got[0]) != "01-home.png" {
+		t.Errorf("empty dir: %v", got)
+	}
+}
+
+func TestExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{fmt.Errorf("ask: %w", browser.ErrUsageLimit), exitLimit},
+		{fmt.Errorf("x: %w", browser.ErrNotLoggedIn), exitLogin},
+		{usageError{errors.New("bad flag")}, exitUsage},
+		{quietError{exitLogin}, exitLogin},
+		{errors.New("usage limit in some text"), exitErr},
+	} {
+		if got := exitCode(tc.err); got != tc.want {
+			t.Errorf("exitCode(%v) = %d, want %d", tc.err, got, tc.want)
 		}
 	}
 }

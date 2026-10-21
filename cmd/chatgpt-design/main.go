@@ -2,7 +2,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +41,7 @@ const (
 const usage = `chatgpt-design: send screenshots and a design prompt to your own ChatGPT, save the answer.
 
 Usage:
+  chatgpt-design doctor                     check Chrome, the profile, the sign-in and the skill, with a fix for each
   chatgpt-design login                      sign in once, in a dedicated Chrome profile
   chatgpt-design status                     say whether that profile is signed in
   chatgpt-design session [show|list]        see this session or all of the project's sessions
@@ -51,6 +56,7 @@ A session is your agent session (Claude Code's id, or --session / CHATGPT_DESIGN
 Its files live in design/chatgpt/<session>/, and every ask continues its ChatGPT chat until --new.
 Chrome starts on the first command and keeps running between runs; each run opens and closes only its own tab.
 Modes: spec (written critique and tokens), redesign (mockup images), logo, chat (--prompt FILE).
+Add --json to doctor, status, session, shoot or ask for machine-readable output on stdout.
 Run "chatgpt-design <command> -h" for flags.
 `
 
@@ -62,7 +68,7 @@ func main() {
 		os.Exit(exitUsage)
 	}
 	cmds := map[string]func(context.Context, []string) error{
-		"login": login, "status": status, "browser": browserCmd, "session": session, "shoot": shoot, "ask": ask, "install-skill": installSkill,
+		"doctor": doctor, "login": login, "status": status, "browser": browserCmd, "session": session, "shoot": shoot, "ask": ask, "install-skill": installSkill,
 	}
 	name, args := os.Args[1], os.Args[2:]
 	switch name {
@@ -82,21 +88,60 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintln(os.Stderr, "chatgpt-design:", err)
-		os.Exit(exitCode(err))
+		code := exitCode(err)
+		var q quietError
+		if !errors.As(err, &q) {
+			fmt.Fprintln(os.Stderr, "chatgpt-design:", err)
+			if jsonOut {
+				_ = emit(struct {
+					OK    bool   `json:"ok"`
+					Error string `json:"error"`
+					Exit  int    `json:"exit"`
+				}{false, err.Error(), code}, nil)
+			}
+		}
+		os.Exit(code)
 	}
+}
+
+// jsonOut is set by a command's --json flag.
+var jsonOut bool
+
+// emit prints v as JSON under --json, and runs text otherwise.
+func emit(v any, text func()) error {
+	if !jsonOut {
+		text()
+		return nil
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return err
+	}
+	_, err := os.Stdout.Write(b.Bytes())
+	return err
 }
 
 type usageError struct{ error }
 
+// quietError exits with code after the command has already reported why.
+type quietError struct{ code int }
+
+func (q quietError) Error() string { return fmt.Sprintf("exit %d", q.code) }
+
 func exitCode(err error) int {
 	var ue usageError
+	var q quietError
 	switch {
+	case errors.As(err, &q):
+		return q.code
 	case errors.As(err, &ue), errors.Is(err, memory.ErrNoSession):
 		return exitUsage
 	case errors.Is(err, browser.ErrNotLoggedIn):
 		return exitLogin
-	case strings.Contains(err.Error(), "usage limit"):
+	case errors.Is(err, browser.ErrUsageLimit):
 		return exitLimit
 	}
 	return exitErr
@@ -131,6 +176,7 @@ func login(ctx context.Context, args []string) error {
 
 func status(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -146,8 +192,7 @@ func status(ctx context.Context, args []string) error {
 	if !ok {
 		return browser.ErrNotLoggedIn
 	}
-	fmt.Println("logged in")
-	return nil
+	return emit(map[string]bool{"logged_in": true}, func() { fmt.Println("logged in") })
 }
 
 func openProfile(ctx context.Context) (context.Context, context.CancelFunc, error) {
@@ -184,16 +229,38 @@ func shoot(ctx context.Context, args []string) error {
 	out := fs.String("out", "", "directory for NN-name.png files (default: the current session's shots/)")
 	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
 	sessionID := fs.String("session", "", "session id (default: the agent's session)")
-	width := fs.Int("width", 1440, "viewport width (at most 1600)")
-	height := fs.Int("height", 900, "viewport height")
-	settle := fs.Duration("wait", 1500*time.Millisecond, "time to let each page settle")
+	width := fs.Int("width", 1440, "viewport width, 320 to 1600 (390 with --mobile)")
+	height := fs.Int("height", 900, "viewport height, 320 to 4000 (844 with --mobile)")
+	settle := fs.Duration("wait", 1500*time.Millisecond, "extra time to let each page settle after it and its fonts load")
 	full := fs.Bool("full", false, "capture the whole page, not just the viewport")
+	mobile := fs.Bool("mobile", false, "shoot as a phone: touch, 3x pixels, mobile user agent")
+	dark := fs.Bool("dark", false, "prefer the dark color scheme")
+	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: chatgpt-design shoot --base URL --out DIR name=/path [name=/path ...]")
+		fmt.Fprintln(os.Stderr, "usage: chatgpt-design shoot --base URL [--out DIR] name=/path [name=/path ...]")
 		fs.PrintDefaults()
 	}
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *mobile {
+		set := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		if !set["width"] {
+			*width = 390
+		}
+		if !set["height"] {
+			*height = 844
+		}
+	}
+	if *width < 320 || *width > 1600 {
+		return usageError{errors.New("--width must be 320 to 1600")}
+	}
+	if *height < 320 || *height > 4000 {
+		return usageError{errors.New("--height must be 320 to 4000")}
+	}
+	if *settle < 0 {
+		return usageError{errors.New("--wait must not be negative")}
 	}
 	pages, err := shotTargets(*base, fs.Args())
 	if err != nil {
@@ -212,31 +279,103 @@ func shoot(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		// A run that asks is reading these shots; another shoot would race for the numbers.
+		unlock, err := cur.Lock(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		*out = filepath.Join(cur.Dir(), "shots")
-	}
-	if *width < 320 || *width > 1600 {
-		return usageError{errors.New("--width must be 320 to 1600")}
 	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
-	tab, closeTab, err := browser.Start(ctx, browser.Options{Headless: true, Width: *width, Height: *height})
+	names := make([]string, len(pages))
+	for i, p := range pages {
+		names[i] = p.name
+	}
+	paths, err := shotPaths(*out, names)
+	if err != nil {
+		return err
+	}
+	tab, closeTab, err := browser.Start(ctx, browser.Options{Headless: true, Mobile: *mobile, Width: *width, Height: *height})
 	if err != nil {
 		return err
 	}
 	defer closeTab()
+	opts := browser.ShotOptions{Width: *width, Height: *height, Settle: *settle, Full: *full, Mobile: *mobile, Dark: *dark}
 	for i, p := range pages {
-		buf, err := browser.Shot(tab, p.url, *width, *height, *settle, *full)
+		buf, err := browser.Shot(tab, p.url, opts)
+		if err != nil && strings.Contains(err.Error(), "ERR_CONNECTION_REFUSED") {
+			return fmt.Errorf("%s: nothing answers there; start the app or fix --base", p.url)
+		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", p.url, err)
 		}
-		path := filepath.Join(*out, fmt.Sprintf("%02d-%s.png", i+1, p.name))
-		if err := os.WriteFile(path, buf, 0o644); err != nil {
+		if err := writeAtomic(paths[i], buf); err != nil {
 			return err
 		}
-		fmt.Println(path)
+		if !jsonOut {
+			fmt.Println(paths[i])
+		}
 	}
-	return nil
+	return emit(map[string][]string{"shots": paths}, func() {})
+}
+
+var shotName = regexp.MustCompile(`^(\d+)-(.+)\.png$`)
+
+// shotPaths names each page's file: a page shot before keeps its file and number, so a re-shoot
+// replaces it, and a new page takes the next number after those in dir.
+func shotPaths(dir string, names []string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	had := map[string]string{}
+	last := 0
+	for _, e := range entries {
+		m := shotName.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		n, _ := strconv.Atoi(m[1])
+		last = max(last, n)
+		had[m[2]] = e.Name()
+	}
+	out := make([]string, len(names))
+	for i, name := range names {
+		file, ok := had[name]
+		if !ok {
+			last++
+			file = fmt.Sprintf("%02d-%s.png", last, name)
+			had[name] = file
+		}
+		out[i] = filepath.Join(dir, file)
+	}
+	return out, nil
+}
+
+// writeAtomic replaces path in one step, so a failed run never leaves half an image to be sent.
+// The temp file has a name of its own, so two runs never write into the same one.
+func writeAtomic(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(f.Name(), 0o644)
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
 }
 
 type target struct{ name, url string }
@@ -250,6 +389,7 @@ func shotTargets(base string, args []string) ([]target, error) {
 	}
 	base = strings.TrimRight(base, "/")
 	var out []target
+	seen := map[string]bool{}
 	for _, a := range args {
 		name, path, ok := strings.Cut(a, "=")
 		if !ok || name == "" {
@@ -258,6 +398,10 @@ func shotTargets(base string, args []string) ([]target, error) {
 		if strings.ContainsAny(name, `/\. `) {
 			return nil, fmt.Errorf("page name %q must be a plain word like inbox-connect", name)
 		}
+		if seen[name] {
+			return nil, fmt.Errorf("page name %q is used twice", name)
+		}
+		seen[name] = true
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
@@ -280,6 +424,7 @@ func ask(ctx context.Context, args []string) error {
 	dry := fs.Bool("dry-run", false, "print the prompt and files, send nothing")
 	chat := fs.String("chat", "", "continue this ChatGPT conversation URL, or \"latest\" for the newest in the sidebar (the session adopts it)")
 	collect := fs.Bool("collect", false, "send nothing; save the answer to the chat's last message (rerun a failed ask with the same flags)")
+	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	var shots multi
 	fs.Var(&shots, "shot", "screenshot to attach (repeatable; a new chat defaults to SESSION/shots/*)")
 	if err := parse(fs, args); err != nil {
@@ -287,6 +432,15 @@ func ask(ctx context.Context, args []string) error {
 	}
 	if fs.NArg() > 0 {
 		return usageError{fmt.Errorf("unexpected argument %q", fs.Arg(0))}
+	}
+	if *timeout <= 0 {
+		return usageError{errors.New("--timeout must be positive")}
+	}
+	if *chat != "" && *chat != browser.Latest && !browser.IsChatURL(*chat) {
+		return usageError{fmt.Errorf("--chat %q is not a ChatGPT conversation URL (https://chatgpt.com/c/...) or latest", *chat)}
+	}
+	if *newChat && (*chat != "" || *collect) {
+		return usageError{errors.New("--new starts an empty chat: it cannot go with --chat or --collect")}
 	}
 	p, err := memory.Open(*project)
 	if err != nil {
@@ -299,6 +453,17 @@ func ask(ctx context.Context, args []string) error {
 	sess, err := p.Session(id, time.Now())
 	if err != nil {
 		return usageError{err}
+	}
+	if !*dry {
+		unlock, err := sess.Lock(ctx)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		// Read the session again under the lock: a run that just ended may have moved it on.
+		if sess, err = p.Session(id, time.Now()); err != nil {
+			return err
+		}
 	}
 	if *newChat {
 		sess.NewChat()
@@ -326,17 +491,23 @@ func ask(ctx context.Context, args []string) error {
 		return err
 	}
 	if *dry {
-		fmt.Println(text)
-		fmt.Println("---")
-		for _, f := range files {
-			fmt.Println("attach:", f)
-		}
 		chat := sess.ChatURL
 		if chat == "" {
 			chat = "new"
 		}
-		fmt.Printf("session: %s, chat: %s\n", sess.ID, chat)
-		return nil
+		return emit(struct {
+			Prompt  string   `json:"prompt"`
+			Attach  []string `json:"attach"`
+			Session string   `json:"session"`
+			Chat    string   `json:"chat"`
+		}{text, nonNil(files), sess.ID, chat}, func() {
+			fmt.Println(text)
+			fmt.Println("---")
+			for _, f := range files {
+				fmt.Println("attach:", f)
+			}
+			fmt.Printf("session: %s, chat: %s\n", sess.ID, chat)
+		})
 	}
 
 	tab, closeTab, err := openProfile(ctx)
@@ -381,13 +552,32 @@ func ask(ctx context.Context, args []string) error {
 	for _, w := range e.Warnings {
 		logf("warning: %s", w)
 	}
-	fmt.Println("session:", sess.ID)
-	fmt.Println("chat log:", filepath.Join(sess.Dir(), "chat.md"))
-	for _, im := range e.Images {
-		fmt.Println("image:", filepath.Join(sess.Dir(), im))
+	images := make([]string, len(e.Images))
+	for i, im := range e.Images {
+		images[i] = filepath.Join(sess.Dir(), im)
 	}
-	fmt.Println("chat:", sess.ChatURL)
-	return nil
+	return emit(struct {
+		Session  string   `json:"session"`
+		ChatLog  string   `json:"chat_log"`
+		Images   []string `json:"images"`
+		Chat     string   `json:"chat"`
+		Warnings []string `json:"warnings"`
+	}{sess.ID, filepath.Join(sess.Dir(), "chat.md"), images, sess.ChatURL, nonNil(e.Warnings)}, func() {
+		fmt.Println("session:", sess.ID)
+		fmt.Println("chat log:", filepath.Join(sess.Dir(), "chat.md"))
+		for _, im := range images {
+			fmt.Println("image:", im)
+		}
+		fmt.Println("chat:", sess.ChatURL)
+	})
+}
+
+// nonNil keeps an empty list as [] in JSON, not null.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // chatURL keeps the session on the conversation it already has, and adopts the one ChatGPT opened otherwise.
@@ -416,6 +606,7 @@ func session(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("session", flag.ContinueOnError)
 	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
 	sessionID := fs.String("session", "", "session id (default: the agent's session)")
+	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: chatgpt-design session [show|list]")
 		fs.PrintDefaults()
@@ -445,28 +636,48 @@ func session(_ context.Context, args []string) error {
 		if chat == "" {
 			chat = "none yet (the next ask starts it)"
 		}
-		fmt.Println("session:", s.ID)
-		fmt.Println("dir:", s.Dir())
-		fmt.Println("chat:", chat)
-		fmt.Println("asks:", s.Asks)
-		return nil
+		return emit(sessionJSON(s, true), func() {
+			fmt.Println("session:", s.ID)
+			fmt.Println("dir:", s.Dir())
+			fmt.Println("chat:", chat)
+			fmt.Println("asks:", s.Asks)
+		})
 	case "list":
 		all, err := p.List()
 		if err != nil {
 			return err
 		}
 		cur, _ := memory.SessionID(*sessionID, os.Getenv)
-		for _, s := range all {
-			mark := " "
-			if s.ID == cur {
-				mark = "*"
-			}
-			fmt.Printf("%s %s  %s  %d ask(s)  %s\n", mark, s.ID, s.Updated.Local().Format("2006-01-02 15:04"), s.Asks, s.ChatURL)
+		list := make([]sessionOut, len(all))
+		for i, s := range all {
+			list[i] = sessionJSON(s, s.ID == cur)
 		}
-		return nil
+		return emit(list, func() {
+			for _, s := range all {
+				mark := " "
+				if s.ID == cur {
+					mark = "*"
+				}
+				fmt.Printf("%s %s  %s  %d ask(s)  %s\n", mark, s.ID, s.Updated.Local().Format("2006-01-02 15:04"), s.Asks, s.ChatURL)
+			}
+		})
 	default:
 		return usageError{fmt.Errorf("unknown session command %q, want show or list", verb)}
 	}
+}
+
+type sessionOut struct {
+	ID      string    `json:"id"`
+	Dir     string    `json:"dir"`
+	Chat    string    `json:"chat"`
+	Asks    int       `json:"asks"`
+	Created time.Time `json:"created"`
+	Updated time.Time `json:"updated"`
+	Current bool      `json:"current"`
+}
+
+func sessionJSON(s *memory.Session, current bool) sessionOut {
+	return sessionOut{s.ID, s.Dir(), s.ChatURL, s.Asks, s.Created, s.Updated, current}
 }
 
 func buildPrompt(mode, briefPath, brandPath, promptPath, goal string, files []string) (string, error) {
@@ -551,7 +762,12 @@ func findShots(dir string) ([]string, error) {
 // checkShots resolves the screenshots to absolute paths of regular image files within the limits.
 func checkShots(shots []string) ([]string, error) {
 	if len(shots) > maxShots {
-		return nil, fmt.Errorf("%d screenshots: ChatGPT takes at most %d per message", len(shots), maxShots)
+		names := make([]string, len(shots))
+		for i, s := range shots {
+			names[i] = filepath.Base(s)
+		}
+		return nil, fmt.Errorf("%d screenshots (%s): ChatGPT takes at most %d per message; pick some with --shot, or delete old ones from the shots folder",
+			len(shots), strings.Join(names, ", "), maxShots)
 	}
 	var out []string
 	for _, s := range shots {
@@ -585,18 +801,16 @@ func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 func installSkill(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("install-skill", flag.ContinueOnError)
 	var dirs multi
-	fs.Var(&dirs, "dir", "skills directory (repeatable; default ~/.claude/skills, ~/.codex/skills, ~/.agents/skills)")
+	fs.Var(&dirs, "dir", "skills directory (repeatable; default: the skills folder of each agent found, ~/.claude, ~/.codex, ~/.agents)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	if len(dirs) == 0 {
-		home, err := os.UserHomeDir()
+		found, err := skillDirs()
 		if err != nil {
 			return err
 		}
-		for _, d := range []string{".claude/skills", ".codex/skills", ".agents/skills"} {
-			dirs = append(dirs, filepath.Join(home, d))
-		}
+		dirs = found
 	}
 	for _, d := range dirs {
 		target := filepath.Join(d, "chatgpt-design")
@@ -604,10 +818,28 @@ func installSkill(_ context.Context, args []string) error {
 			return err
 		}
 		path := filepath.Join(target, "SKILL.md")
-		if err := os.WriteFile(path, skill.Markdown, 0o644); err != nil {
+		if err := writeAtomic(path, skill.Markdown); err != nil {
 			return err
 		}
 		fmt.Println(path)
 	}
 	return nil
+}
+
+// skillDirs lists the skills folder of each agent installed here, or Claude Code's when none is.
+func skillDirs() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, agent := range []string{".claude", ".codex", ".agents"} {
+		if fi, err := os.Stat(filepath.Join(home, agent)); err == nil && fi.IsDir() {
+			out = append(out, filepath.Join(home, agent, "skills"))
+		}
+	}
+	if len(out) == 0 {
+		out = []string{filepath.Join(home, ".claude", "skills")}
+	}
+	return out, nil
 }
