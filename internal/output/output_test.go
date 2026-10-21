@@ -55,3 +55,20 @@ func TestMarkdownNumberedParagraphs(t *testing.T) {
 		t.Errorf("%q", got)
 	}
 }
+
+func TestSaveNeverOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	imgDir := filepath.Join(dir, "images")
+	os.MkdirAll(imgDir, 0o755)
+	// 01 was deleted by hand; 02 and 03 remain. The next image is 04, never a reused 03.
+	os.WriteFile(filepath.Join(imgDir, "02.png"), []byte("keep2"), 0o644)
+	os.WriteFile(filepath.Join(imgDir, "03.png"), []byte("keep3"), 0o644)
+	os.WriteFile(filepath.Join(imgDir, "notes.txt"), []byte("x"), 0o644)
+	e, err := Save(dir, "p", &browser.Result{HTML: "<p>x</p>", Images: []browser.Image{{Data: png, Type: "image/png"}, {Data: png, Type: "image/png"}}}, Entry{Mode: "redesign"})
+	if err != nil || len(e.Images) != 2 || e.Images[0] != "images/04.png" || e.Images[1] != "images/05.png" {
+		t.Fatalf("%+v %v", e.Images, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(imgDir, "03.png")); string(b) != "keep3" {
+		t.Error("03.png overwritten")
+	}
+}

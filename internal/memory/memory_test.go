@@ -3,6 +3,7 @@ package memory
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,4 +97,25 @@ func TestAdoptSavesChatBeforeAnyAsk(t *testing.T) {
 	if again.ChatURL != "https://chatgpt.com/c/xyz" || again.Asks != 0 {
 		t.Fatalf("after adopt: chat %q, asks %d", again.ChatURL, again.Asks)
 	}
+}
+
+func TestSessionLock(t *testing.T) {
+	p := &Project{Root: t.TempDir()}
+	s, err := p.Session("abc", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := s.Lock(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Lock(t.Context()); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("second lock: %v", err)
+	}
+	unlock()
+	unlock, err = s.Lock(t.Context())
+	if err != nil {
+		t.Fatalf("after unlock: %v", err)
+	}
+	unlock()
 }

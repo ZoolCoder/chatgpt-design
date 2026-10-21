@@ -11,6 +11,7 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/zoolcoder/chatgpt-design/internal/lockfile"
 )
 
 // Dir is where a project's memory lives, relative to its root.
@@ -121,6 +124,20 @@ func (p *Project) List() ([]*Session, error) {
 
 // Dir is the session's directory.
 func (s *Session) Dir() string { return s.dir }
+
+// Lock keeps other runs out of the session until the returned func is called, so two asks never
+// interleave in one chat or write the same files.
+func (s *Session) Lock(ctx context.Context) (func(), error) {
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return nil, err
+	}
+	unlock, err := lockfile.Acquire(ctx, filepath.Join(s.dir, ".lock"), 0)
+	var held lockfile.HeldError
+	if errors.As(err, &held) {
+		return nil, fmt.Errorf("session %s is busy: another chatgpt-design run (pid %d) is using it; wait for it, or pass --session for a separate one", s.ID, held.PID)
+	}
+	return unlock, err
+}
 
 // Saved reports whether the session has been written to disk.
 func (s *Session) Saved() bool {

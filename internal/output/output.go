@@ -2,10 +2,12 @@
 package output
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -69,13 +71,13 @@ func Save(dir, prompt string, r *browser.Result, e Entry) (Entry, error) {
 		if err := os.MkdirAll(imgDir, 0o755); err != nil {
 			return e, err
 		}
-		n, err := countImages(imgDir)
+		n, err := lastNumber(imgDir)
 		if err != nil {
 			return e, err
 		}
-		for i, im := range r.Images {
-			name := fmt.Sprintf("%02d%s", n+i+1, ext(im.Type))
-			if err := os.WriteFile(filepath.Join(imgDir, name), im.Data, 0o644); err != nil {
+		for _, im := range r.Images {
+			name, err := writeNew(imgDir, &n, ext(im.Type), im.Data)
+			if err != nil {
 				return e, err
 			}
 			e.Images = append(e.Images, "images/"+name)
@@ -106,18 +108,41 @@ func entryMarkdown(prompt, answer string, e Entry) string {
 	return b.String()
 }
 
-func countImages(dir string) (int, error) {
+// lastNumber is the highest NN among dir's NN.ext files, so a deleted image never makes the next
+// one reuse a number that is still taken.
+func lastNumber(dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
 	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			n++
+		base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		if v, err := strconv.Atoi(base); err == nil && v > n {
+			n = v
 		}
 	}
 	return n, nil
+}
+
+// writeNew writes data to the next free NN.ext after *n and never replaces a file.
+func writeNew(dir string, n *int, ext string, data []byte) (string, error) {
+	for {
+		*n++
+		name := fmt.Sprintf("%02d%s", *n, ext)
+		f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		_, err = f.Write(data)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		return name, err
+	}
 }
 
 func ext(mime string) string {
