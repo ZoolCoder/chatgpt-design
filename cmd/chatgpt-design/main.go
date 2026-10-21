@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -34,13 +35,15 @@ import (
 var version = "dev"
 
 const (
-	exitErr      = 1
-	exitUsage    = 2
-	exitLogin    = 3
-	exitLimit    = 4
-	maxShots     = 10
-	maxShotBytes = 20 << 20
-	maxTextBytes = 256 << 10
+	exitErr   = 1
+	exitUsage = 2
+	exitLogin = 3
+	exitLimit = 4
+	// exitInterrupted is the shell's code for a run ended by Ctrl-C.
+	exitInterrupted = 130
+	maxShots        = 10
+	maxShotBytes    = 20 << 20
+	maxTextBytes    = 256 << 10
 )
 
 const usage = `chatgpt-design: send screenshots and a design prompt to your own ChatGPT, save the answer.
@@ -95,6 +98,10 @@ func main() {
 	if err := run(ctx, args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
+		}
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "chatgpt-design: interrupted")
+			os.Exit(exitInterrupted)
 		}
 		code := exitCode(err)
 		var q quietError
@@ -208,16 +215,70 @@ func openProfile(ctx context.Context) (context.Context, context.CancelFunc, erro
 	if err != nil {
 		return nil, nil, err
 	}
-	return browser.Open(ctx, dir)
+	tab, closeTab, err := browser.Open(ctx, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	startWatch()
+	return tab, closeTab, nil
+}
+
+// defaultIdle is how long the background Chrome waits for another run before it quits.
+const defaultIdle = 15 * time.Minute
+
+// idleTime reads CHATGPT_DESIGN_IDLE; 0 keeps Chrome running until browser stop.
+func idleTime() (time.Duration, error) {
+	v := os.Getenv("CHATGPT_DESIGN_IDLE")
+	if v == "" {
+		return defaultIdle, nil
+	}
+	if v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < time.Minute {
+		return 0, fmt.Errorf("CHATGPT_DESIGN_IDLE=%q: want a duration of 1m or more, like 30m, or 0 to never quit", v)
+	}
+	return d, nil
+}
+
+// startWatch starts a background watcher that quits Chrome once it sits idle. It exits at once
+// when one already runs, so every run can start it.
+func startWatch() {
+	if d, err := idleTime(); err != nil || d == 0 {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "browser", "watch")
+	browser.Detach(cmd)
+	if cmd.Start() == nil {
+		_ = cmd.Process.Release()
+	}
 }
 
 func browserCmd(ctx context.Context, args []string) error {
-	if len(args) != 1 || args[0] != "stop" {
-		return usageError{errors.New("usage: chatgpt-design browser stop")}
+	const use = "usage: chatgpt-design browser stop"
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Fprintln(os.Stderr, use)
+		return flag.ErrHelp
+	}
+	if len(args) != 1 || args[0] != "stop" && args[0] != "watch" {
+		return usageError{errors.New(use)}
 	}
 	dir, err := browser.ProfileDir()
 	if err != nil {
 		return err
+	}
+	if args[0] == "watch" {
+		// Started by startWatch, detached; not meant to be run by hand.
+		idle, err := idleTime()
+		if err != nil || idle == 0 {
+			return err
+		}
+		return browser.Watch(ctx, dir, idle)
 	}
 	was, err := browser.Stop(ctx, dir)
 	if err != nil {
@@ -951,12 +1012,18 @@ func buildPrompt(mode, briefPath, brandPath, promptPath, goal string, files []st
 		return "", usageError{errors.New("no brief: write SESSION/brief.md or pass --brief")}
 	}
 	brief, err := readText(briefPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", usageError{fmt.Errorf("no brief at %s: write it, or pass --brief FILE", briefPath)}
+	}
 	if err != nil {
 		return "", usageError{err}
 	}
 	brand := ""
 	if brandPath != "" {
 		if brand, err = readText(brandPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				err = fmt.Errorf("--brand %s: no such file", brandPath)
+			}
 			return "", usageError{err}
 		}
 	}
@@ -1026,6 +1093,9 @@ func checkShots(shots []string) ([]string, error) {
 			return nil, err
 		}
 		fi, err := os.Stat(abs)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("--shot %s: no such file", s)
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -140,6 +140,10 @@ func Login(ctx context.Context, timeout time.Duration, log func(string, ...any))
 	if err := chromedp.Do(ctx, chromedp.Navigate(Home)); err != nil {
 		return err
 	}
+	if ok, err := session(ctx); err == nil && ok != nil && *ok {
+		log("Already signed in. The session is kept in the chatgpt-design Chrome profile.")
+		return nil
+	}
 	log("Sign in to ChatGPT in the Chrome window that just opened. Waiting up to %s.", timeout)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

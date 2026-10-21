@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zoolcoder/chatgpt-design/internal/browser"
 )
@@ -154,5 +155,20 @@ func TestSizes(t *testing.T) {
 	}
 	if _, err := shotTargets("http://x", []string{"a@1=/"}); err == nil {
 		t.Error("@ in a page name accepted")
+	}
+}
+
+func TestIdleTime(t *testing.T) {
+	for v, want := range map[string]time.Duration{"": defaultIdle, "0": 0, "30m": 30 * time.Minute} {
+		t.Setenv("CHATGPT_DESIGN_IDLE", v)
+		if got, err := idleTime(); err != nil || got != want {
+			t.Errorf("%q: %v %v", v, got, err)
+		}
+	}
+	for _, v := range []string{"soon", "10s", "-5m"} {
+		t.Setenv("CHATGPT_DESIGN_IDLE", v)
+		if _, err := idleTime(); err == nil {
+			t.Errorf("%q accepted", v)
+		}
 	}
 }

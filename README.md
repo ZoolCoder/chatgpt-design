@@ -37,7 +37,7 @@ Prebuilt binaries for macOS, Linux and Windows are on the [releases page](https:
 ## Set up once
 
 ```sh
-chatgpt-design login           # opens Chrome, you sign in to chatgpt.com; Chrome stays open for later runs
+chatgpt-design login           # opens Chrome, you sign in to chatgpt.com; Chrome stays open for later runs, until 15 min idle
 chatgpt-design doctor          # checks Chrome, the profile, the sign-in and the skill
 chatgpt-design install-skill   # adds the skill for Claude Code, Codex and other agents
 ```
@@ -162,7 +162,9 @@ One ask runs per session at a time: a second one fails at once with `session ...
 
 ### `browser stop`: quit the background Chrome
 
-The first command starts Chrome on the tool's profile and leaves it running. Every later run attaches to it, opens one tab and closes only that tab, so you stay signed in, nothing reloads from cold, and Chrome never sees an unclean shutdown. Commands started together share that one Chrome: only one of them starts it. Leave the window alone during a run. `chatgpt-design browser stop` quits it cleanly. On macOS and Linux it also ends a Chrome that holds the port but no longer answers; it only ever ends a process that is Chrome.
+The first command starts Chrome on the tool's profile and leaves it running. Every later run attaches to it, opens one tab and closes only that tab, so you stay signed in, nothing reloads from cold, and Chrome never sees an unclean shutdown. Commands started together share that one Chrome: only one of them starts it. Leave the window alone during a run. Between runs, the window shows one `chatgpt-design` tab that says what it is.
+
+Chrome quits by itself once no run has used it for 15 minutes; the next run starts it again in a few seconds. Set `CHATGPT_DESIGN_IDLE` to change that wait, as a duration such as `1h`, or to `0` to keep Chrome running until you stop it. `chatgpt-design browser stop` quits it now, cleanly. On macOS and Linux it also ends a Chrome that holds the port but no longer answers; it only ever ends a process that is Chrome.
 
 ### Exit codes
 
@@ -173,6 +175,7 @@ The first command starts Chrome on the tool's profile and leaves it running. Eve
 | 2 | bad flags or arguments, or no current session |
 | 3 | not logged in: run `chatgpt-design login` |
 | 4 | ChatGPT usage limit reached |
+| 130 | interrupted with Ctrl-C |
 
 ### `--json`
 

@@ -147,10 +147,18 @@ func checkBrowser(ctx context.Context, offline bool) []check {
 	default:
 		out = append(out, check{Name: "browser", OK: true, Detail: "not running; the next command starts it"})
 	}
+	switch idle, err := idleTime(); {
+	case err != nil:
+		out = append(out, check{Name: "idle", Detail: err.Error(), Fix: "set CHATGPT_DESIGN_IDLE to a duration like 30m, or 0"})
+	case idle == 0:
+		out = append(out, check{Name: "idle", OK: true, Detail: "Chrome keeps running until `chatgpt-design browser stop`"})
+	default:
+		out = append(out, check{Name: "idle", OK: true, Detail: fmt.Sprintf("Chrome quits after %s without a run", idle)})
+	}
 	if offline {
 		return out
 	}
-	tab, closeTab, err := browser.Open(ctx, dir)
+	tab, closeTab, err := openProfile(ctx)
 	if err != nil {
 		return append(out, check{Name: "login", Detail: err.Error(), Fix: "see the browser check above"})
 	}

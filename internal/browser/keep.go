@@ -33,6 +33,8 @@ const (
 // The returned cancel closes only the new tab, so the browser, the login and the open chat stay warm
 // between runs, and Chrome never sees an unclean shutdown.
 func Open(ctx context.Context, profile string) (context.Context, context.CancelFunc, error) {
+	// Touch first, so an idle watcher never quits Chrome under a run that is attaching.
+	touch(profile)
 	ws, err := find(ctx, profile)
 	if err != nil {
 		return nil, nil, err
@@ -54,6 +56,7 @@ func Open(ctx context.Context, profile string) (context.Context, context.CancelF
 		_ = chromedp.Cancel(tctx)
 		cancelTab()
 		cancelAlloc()
+		touch(profile)
 	}, nil
 }
 
@@ -144,6 +147,15 @@ func Stop(ctx context.Context, profile string) (bool, error) {
 		return false, sandboxed(err)
 	}
 	pid, alive := holder(profile)
+	// SIGTERM is a clean quit for Chrome on macOS and Linux and ends it at once; Browser.Close
+	// leaves the window up for about ten seconds. Windows has no SIGTERM, so it closes over DevTools.
+	if alive && runtime.GOOS != "windows" {
+		if err := terminate(pid); err != nil {
+			return true, fmt.Errorf("stop Chrome (pid %d): %w", pid, err)
+		}
+		_ = os.Remove(filepath.Join(profile, portFile))
+		return true, waitGone(ctx, profile, pid)
+	}
 	if err != nil {
 		if !alive {
 			return false, nil
@@ -229,9 +241,9 @@ func launch(ctx context.Context, profile string) (string, error) {
 		"--disable-background-timer-throttling",
 		"--disable-backgrounding-occluded-windows",
 		"--disable-renderer-backgrounding",
-		// The blank tab anchors the window: runs open and close their own tabs beside it, and
+		// The anchor tab holds the window: runs open and close their own tabs beside it, and
 		// closing the last tab would close the window and make every run open a new one.
-		"about:blank",
+		anchorPage(profile),
 	)
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
