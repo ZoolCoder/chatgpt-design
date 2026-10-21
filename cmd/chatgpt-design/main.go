@@ -301,7 +301,7 @@ func shoot(ctx context.Context, args []string) error {
 	width := fs.Int("width", 1440, "viewport width, 320 to 1600 (390 with --mobile)")
 	height := fs.Int("height", 900, "viewport height, 320 to 4000 (844 with --mobile)")
 	sizes := fs.String("sizes", "", "shoot every page at each of these widths, e.g. 390,768,1440, as NN-name@WIDTH.png")
-	settle := fs.Duration("wait", 1500*time.Millisecond, "extra time to let each page settle after it and its fonts load")
+	settle := fs.Duration("wait", 3*time.Second, "the longest to wait for each page to stop changing once it and its fonts load")
 	full := fs.Bool("full", false, "capture the whole page, not just the viewport")
 	mobile := fs.Bool("mobile", false, "shoot as a phone: touch, 3x pixels, mobile user agent")
 	dark := fs.Bool("dark", false, "prefer the dark color scheme")
@@ -484,6 +484,9 @@ func shootAll(first context.Context, opts browser.Options, pages []target, o bro
 func shotErr(url string, err error) error {
 	if strings.Contains(err.Error(), "ERR_CONNECTION_REFUSED") {
 		return fmt.Errorf("%s: nothing answers there; start the app or fix --base", url)
+	}
+	if strings.HasPrefix(err.Error(), "HTTP ") {
+		return fmt.Errorf("%s: %w: check --base and the path", url, err)
 	}
 	return fmt.Errorf("%s: %w", url, err)
 }
@@ -808,13 +811,18 @@ func ask(ctx context.Context, args []string) error {
 		Images   []string `json:"images"`
 		Chat     string   `json:"chat"`
 		Warnings []string `json:"warnings"`
-	}{sess.ID, filepath.Join(sess.Dir(), "chat.md"), images, sess.ChatURL, nonNil(e.Warnings)}, func() {
+		Answer   string   `json:"answer"`
+	}{sess.ID, filepath.Join(sess.Dir(), "chat.md"), images, sess.ChatURL, nonNil(e.Warnings), e.Answer}, func() {
 		fmt.Println("session:", sess.ID)
 		fmt.Println("chat log:", filepath.Join(sess.Dir(), "chat.md"))
 		for _, im := range images {
 			fmt.Println("image:", im)
 		}
 		fmt.Println("chat:", sess.ChatURL)
+		// --stream has already printed it.
+		if !*stream && e.Answer != "" {
+			fmt.Printf("\n%s\n", e.Answer)
+		}
 	})
 }
 

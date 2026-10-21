@@ -108,7 +108,7 @@ Each `name=path` becomes `NN-name.png` at 1440×900, in the current session's `s
 | Flag | Default | |
 |---|---|---|
 | `--width`, `--height` | 1440, 900 | viewport, width 320–1600 |
-| `--wait` | 1.5s | extra settle time once the page and its fonts load |
+| `--wait` | 3s | the longest to wait, once the page and its fonts load, for it to stop changing; a still page is shot after 300ms |
 | `--full` | off | whole page instead of the viewport |
 | `--mobile` | off | a phone: 390×844 at 3x, touch, mobile user agent |
 | `--dark` | off | `prefers-color-scheme: dark` |
@@ -146,6 +146,8 @@ chatgpt-design ask --mode spec --goal "fewer setup steps for non-developers"
 | `--goal` | one line on what this ask should optimise for |
 
 `--dry-run` prints the exact prompt, file list and target chat without opening Chrome or creating anything.
+
+When the answer is in, `ask` prints the session, the chat log path, each new image path and the chat URL, then the answer itself as markdown (`answer` with `--json`), so an agent needs no second read.
 
 The session folder holds:
 

@@ -36,7 +36,7 @@ const (
 )
 
 // ErrUsageLimit means ChatGPT refused the message because the account hit a usage limit.
-var ErrUsageLimit = errors.New("ChatGPT usage limit")
+var ErrUsageLimit = errors.New("ChatGPT usage limit (retry later, or switch the model in the chat)")
 
 // Request is one message to ChatGPT.
 type Request struct {
@@ -354,7 +354,7 @@ func typePrompt(ctx context.Context, prompt string) error {
 	}
 	// ProseMirror turns blank lines into paragraphs, so the count drifts a little.
 	if n < len([]rune(prompt))*9/10 {
-		return fmt.Errorf("the composer took %d of %d characters", n, len([]rune(prompt)))
+		return fmt.Errorf("the composer took %d of %d characters: ChatGPT's page may have changed, see error.png", n, len([]rune(prompt)))
 	}
 	return nil
 }
@@ -365,7 +365,7 @@ func send(ctx context.Context) error {
 		ok, _ := eval[bool](ctx, ready)
 		return ok, nil
 	}); err != nil {
-		return errors.New("the send button never became ready")
+		return errors.New("the send button never became ready: ChatGPT's page may have changed, see error.png")
 	}
 	// The last user turn changes when the message lands; its count alone does not grow in a long chat.
 	lastUser := func() string {
@@ -383,7 +383,7 @@ func send(ctx context.Context) error {
 	// A missed click leaves the prompt in the composer; a DOM click is the fallback.
 	_, _ = eval[chromedp.Void](ctx, js(`document.querySelector(SEND)?.click()`))
 	if waitFor(ctx, 15*time.Second, sent) != nil {
-		return errors.New("the message was not sent")
+		return errors.New("the message was not sent: check error.png in the session folder; if the prompt shows in the chat, rerun with --collect, else rerun")
 	}
 	return nil
 }
@@ -398,7 +398,7 @@ func IsChatURL(raw string) bool {
 
 // waitHistory waits until a continued conversation shows its earlier turns and stops growing.
 func waitHistory(ctx context.Context) error {
-	gone := errors.New("the session's ChatGPT conversation did not open (deleted, or another account): start a new session")
+	gone := errors.New("the session's ChatGPT conversation did not open (deleted, or another account): ask the user, then rerun with --new")
 	prev, stable := -1, 0
 	err := waitFor(ctx, 45*time.Second, func() (bool, error) {
 		st, err := eval[struct {
@@ -487,7 +487,7 @@ func waitAnswer(ctx context.Context, r Request) error {
 	check := "(" + answerJS + ")(" + strconv.FormatBool(r.OnText != nil) + ")"
 	// The answer must hold still this long: images keep loading after the text has stopped. Once
 	// ChatGPT marks the turn finished, a short wait only catches the last image swap.
-	settle, quick := 4*time.Second, time.Second
+	settle, quick := 4*time.Second, 500*time.Millisecond
 	if r.WantImages {
 		settle, quick = 8*time.Second, 2*time.Second
 	}
@@ -509,11 +509,11 @@ func waitAnswer(ctx context.Context, r Request) error {
 		case !retried.IsZero() && time.Since(retried) < retryGrace:
 			// The old error stays on screen until the retry gets going.
 		case !retried.IsZero() || !st.Retry:
-			return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
+			return fmt.Errorf("ChatGPT: %s (after one retry): rerun with --collect in a minute", st.ErrMsg)
 		default:
 			r.Log("ChatGPT failed (%s): retrying once", st.ErrMsg)
 			if ok, err := eval[bool](ctx, retryJS); err != nil || !ok {
-				return fmt.Errorf("ChatGPT: %s", st.ErrMsg)
+				return fmt.Errorf("ChatGPT: %s (after one retry): rerun with --collect in a minute", st.ErrMsg)
 			}
 			retried, prev, still = time.Now(), answerState{}, time.Time{}
 		}
@@ -543,12 +543,17 @@ func waitAnswer(ctx context.Context, r Request) error {
 			r.Log("still waiting (%s): %d chars, %d image(s)%s", now.Sub(start).Round(time.Second), st.Len, st.Imgs, activity(st))
 			beat = now.Add(heartbeat)
 		}
-		if err := sleep(ctx, poll); err != nil {
+		// Look closely once the answer may be complete, so a short one returns without a long tail.
+		wait := poll
+		if done {
+			wait = poll / 4
+		}
+		if err := sleep(ctx, wait); err != nil {
 			if r.WantImages && st.N > 0 && st.Imgs == 0 && !st.Stop {
-				return errors.New("timed out: ChatGPT answered without an image (it may have asked a question instead; open the chat)")
+				return errors.New("timed out: ChatGPT answered without an image (it may have asked a question instead; open the chat URL and answer with --mode chat)")
 			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("timed out waiting for ChatGPT's answer (last seen: %d turn(s), %d chars, %d image(s), stop=%t, busy=%t)", st.N, st.Len, st.Imgs, st.Stop, st.Busy)
+				return fmt.Errorf("timed out waiting for ChatGPT's answer (last seen: %d turn(s), %d chars, %d image(s), stop=%t, busy=%t); open the chat URL: if ChatGPT asked something, answer with --mode chat; if it is still answering, rerun with --collect", st.N, st.Len, st.Imgs, st.Stop, st.Busy)
 			}
 			return err
 		}
@@ -567,7 +572,7 @@ func activity(st answerState) string {
 
 func waitErr(ctx context.Context, err error) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return errors.New("timed out waiting for ChatGPT's answer")
+		return errors.New("timed out waiting for ChatGPT's answer; open the chat URL: if ChatGPT asked something, answer with --mode chat; if it is still answering, rerun with --collect")
 	}
 	return err
 }
@@ -721,7 +726,7 @@ func Screenshot(ctx context.Context, path string) error {
 // ShotOptions sets up one screenshot.
 type ShotOptions struct {
 	Width, Height int
-	Settle        time.Duration // extra wait once the page and its fonts have loaded
+	Settle        time.Duration // the longest to wait, once the page and its fonts load, for it to stop changing
 	Full          bool          // the whole page, not just the viewport
 	Mobile        bool          // a phone: touch, 3x pixels, mobile user agent
 	Dark          bool          // prefers-color-scheme: dark
@@ -757,14 +762,45 @@ func Shot(ctx context.Context, url string, o ShotOptions) ([]byte, error) {
 	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	_, _ = eval[bool](fctx, `document.fonts.ready.then(() => true)`, chromedp.EvalAwaitPromise)
 	cancel()
-	if err := sleep(ctx, o.Settle); err != nil {
-		return nil, err
+	if o.Settle > 0 {
+		sctx, cancel := context.WithTimeout(ctx, o.Settle+5*time.Second)
+		_, err = eval[bool](sctx, fmt.Sprintf(settleJS, o.Settle.Milliseconds()), chromedp.EvalAwaitPromise)
+		cancel()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 	if o.Full {
 		return chromedp.Run(ctx, chromedp.FullScreenshot(100))
 	}
 	return chromedp.Run(ctx, chromedp.CaptureScreenshot())
 }
+
+// settleJS resolves once the page has been still for 300ms: no DOM change, no new request, every
+// image loaded and every finite animation done. It gives up after %d ms, so a page that never
+// stops moving is still captured.
+const settleJS = `new Promise(done => {
+  const start = performance.now(), cap = %d;
+  let last = start;
+  const touch = () => { last = performance.now(); };
+  const mo = new MutationObserver(touch);
+  mo.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+  const po = new PerformanceObserver(touch);
+  po.observe({type: 'resource'});
+  const moving = () => document.getAnimations().some(a =>
+    a.playState === 'running' && a.effect?.getComputedTiming().iterations !== Infinity);
+  (function tick() {
+    const now = performance.now();
+    const still = now - last >= 300 && [...document.images].every(i => i.complete) && !moving();
+    if (still || now - start >= cap) {
+      mo.disconnect();
+      po.disconnect();
+      done(true);
+      return;
+    }
+    setTimeout(tick, 50);
+  })();
+})`
 
 func waitFor(ctx context.Context, limit time.Duration, check func() (bool, error)) error {
 	deadline := time.Now().Add(limit)

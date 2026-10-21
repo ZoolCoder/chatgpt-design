@@ -27,6 +27,7 @@ type Entry struct {
 	Shots    []string
 	Images   []string
 	Warnings []string
+	Answer   string // the answer as markdown, without images
 }
 
 var conv = converter.NewConverter(converter.WithPlugins(
@@ -60,6 +61,7 @@ func Save(dir, prompt string, r *browser.Result, e Entry) (Entry, error) {
 		return e, err
 	}
 	md := Markdown(r)
+	e.Answer = strings.TrimSpace(md)
 	if e.Mode == "spec" && !HasVerdict(md) {
 		e.Warnings = append(e.Warnings, "the answer has no Verdict heading: ChatGPT did not follow the spec format")
 	}

@@ -59,10 +59,13 @@ func touch(profile string) {
 	}
 }
 
-// Watch quits the profile's Chrome once no run has used it for idle, then returns. It returns at
-// once when another watcher already runs, and as soon as Chrome is gone.
+// Watch quits the profile's Chrome once no run has used it for idle, then returns. It returns when
+// another watcher keeps running, and as soon as Chrome is gone.
 func Watch(ctx context.Context, profile string, idle time.Duration) error {
-	unlock, err := lockfile.Acquire(ctx, filepath.Join(profile, watchLock), 0)
+	tick := min(max(idle/4, time.Second), 30*time.Second)
+	// Wait out one tick: a watcher that just saw the last Chrome go is about to let go, and this
+	// Chrome needs a watcher of its own.
+	unlock, err := lockfile.Acquire(ctx, filepath.Join(profile, watchLock), tick+5*time.Second)
 	if errors.Is(err, lockfile.ErrHeld) {
 		return nil
 	}
@@ -70,7 +73,6 @@ func Watch(ctx context.Context, profile string, idle time.Duration) error {
 		return err
 	}
 	defer unlock()
-	tick := min(max(idle/4, time.Second), 30*time.Second)
 	for {
 		if err := sleep(ctx, tick); err != nil {
 			return err
