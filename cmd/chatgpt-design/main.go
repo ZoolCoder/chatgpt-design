@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,10 +17,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zoolcoder/chatgpt-design/internal/browser"
+	"github.com/zoolcoder/chatgpt-design/internal/export"
+	"github.com/zoolcoder/chatgpt-design/internal/imgdiff"
 	"github.com/zoolcoder/chatgpt-design/internal/memory"
 	"github.com/zoolcoder/chatgpt-design/internal/output"
 	"github.com/zoolcoder/chatgpt-design/internal/prompt"
@@ -45,9 +50,12 @@ Usage:
   chatgpt-design login                      sign in once, in a dedicated Chrome profile
   chatgpt-design status                     say whether that profile is signed in
   chatgpt-design session [show|list]        see this session or all of the project's sessions
+  chatgpt-design session export             write the session as one HTML file to open or share
   chatgpt-design shoot --base URL name=/path ...
                                             screenshot pages of a running app into the session
+                                            (--sizes 390,768,1440 for each width, --diff to see what changed)
   chatgpt-design ask --mode MODE            send to the session's chat, save the round in the session
+                                            (--stream prints the answer as it arrives)
   chatgpt-design browser stop               quit the background Chrome that keeps you signed in
   chatgpt-design install-skill              install the agent skill for Claude Code, Codex and others
   chatgpt-design version
@@ -231,10 +239,12 @@ func shoot(ctx context.Context, args []string) error {
 	sessionID := fs.String("session", "", "session id (default: the agent's session)")
 	width := fs.Int("width", 1440, "viewport width, 320 to 1600 (390 with --mobile)")
 	height := fs.Int("height", 900, "viewport height, 320 to 4000 (844 with --mobile)")
+	sizes := fs.String("sizes", "", "shoot every page at each of these widths, e.g. 390,768,1440, as NN-name@WIDTH.png")
 	settle := fs.Duration("wait", 1500*time.Millisecond, "extra time to let each page settle after it and its fonts load")
 	full := fs.Bool("full", false, "capture the whole page, not just the viewport")
 	mobile := fs.Bool("mobile", false, "shoot as a phone: touch, 3x pixels, mobile user agent")
 	dark := fs.Bool("dark", false, "prefer the dark color scheme")
+	diff := fs.Bool("diff", false, "compare each page with its last shot and save the changes to shots/diff/")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: chatgpt-design shoot --base URL [--out DIR] name=/path [name=/path ...]")
@@ -243,9 +253,9 @@ func shoot(ctx context.Context, args []string) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	if *mobile {
-		set := map[string]bool{}
-		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 		if !set["width"] {
 			*width = 390
 		}
@@ -253,8 +263,20 @@ func shoot(ctx context.Context, args []string) error {
 			*height = 844
 		}
 	}
-	if *width < 320 || *width > 1600 {
-		return usageError{errors.New("--width must be 320 to 1600")}
+	widths := []int{*width}
+	if *sizes != "" {
+		if set["width"] {
+			return usageError{errors.New("--sizes sets the widths: it cannot go with --width")}
+		}
+		var err error
+		if widths, err = parseSizes(*sizes); err != nil {
+			return usageError{err}
+		}
+	}
+	for _, w := range widths {
+		if w < 320 || w > 1600 {
+			return usageError{fmt.Errorf("width %d: widths must be 320 to 1600", w)}
+		}
 	}
 	if *height < 320 || *height > 4000 {
 		return usageError{errors.New("--height must be 320 to 4000")}
@@ -265,6 +287,13 @@ func shoot(ctx context.Context, args []string) error {
 	pages, err := shotTargets(*base, fs.Args())
 	if err != nil {
 		return usageError{err}
+	}
+	if *sizes != "" {
+		pages = atSizes(pages, widths)
+	} else {
+		for i := range pages {
+			pages[i].width = *width
+		}
 	}
 	if *out == "" {
 		p, err := memory.Open(*project)
@@ -298,28 +327,169 @@ func shoot(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	tab, closeTab, err := browser.Start(ctx, browser.Options{Headless: true, Mobile: *mobile, Width: *width, Height: *height})
+	opts := browser.Options{Headless: true, Mobile: *mobile, Width: widths[0], Height: *height}
+	tab, closeTab, err := browser.Start(ctx, opts)
 	if err != nil {
 		return err
 	}
 	defer closeTab()
-	opts := browser.ShotOptions{Width: *width, Height: *height, Settle: *settle, Full: *full, Mobile: *mobile, Dark: *dark}
-	for i, p := range pages {
-		buf, err := browser.Shot(tab, p.url, opts)
-		if err != nil && strings.Contains(err.Error(), "ERR_CONNECTION_REFUSED") {
-			return fmt.Errorf("%s: nothing answers there; start the app or fix --base", p.url)
-		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", p.url, err)
+	shots, err := shootAll(tab, opts, pages, browser.ShotOptions{Height: *height, Settle: *settle, Full: *full, Mobile: *mobile, Dark: *dark})
+	if err != nil {
+		return err
+	}
+	var diffs []shotDiff
+	for i, buf := range shots {
+		if *diff {
+			d, err := diffShot(paths[i], pages[i].name, buf)
+			if err != nil {
+				return err
+			}
+			if d != nil {
+				diffs = append(diffs, *d)
+			}
 		}
 		if err := writeAtomic(paths[i], buf); err != nil {
 			return err
 		}
-		if !jsonOut {
-			fmt.Println(paths[i])
+	}
+	return emit(struct {
+		Shots []string   `json:"shots"`
+		Diffs []shotDiff `json:"diffs,omitempty"`
+	}{paths, diffs}, func() {
+		for _, p := range paths {
+			fmt.Println(p)
+		}
+	})
+}
+
+// shotTabs is how many pages load at once: enough to hide each page's settle time, few enough
+// that a dev server does not slow down under the load.
+const shotTabs = 4
+
+// shootAll captures pages side by side in a few tabs of one browser and returns the images in
+// page order. It stops at the first page that fails.
+func shootAll(first context.Context, opts browser.Options, pages []target, o browser.ShotOptions) ([][]byte, error) {
+	ctx, cancel := context.WithCancel(first)
+	defer cancel()
+	tabs := []context.Context{first}
+	for range min(shotTabs, len(pages)) - 1 {
+		tab, closeTab, err := browser.Tab(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		defer closeTab()
+		tabs = append(tabs, tab)
+	}
+	out := make([][]byte, len(pages))
+	// The first failure cancels the rest, so keep it, not the errors the cancel causes.
+	var once sync.Once
+	var failed error
+	next := make(chan int)
+	done := make(chan struct{})
+	for _, tab := range tabs {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			for i := range next {
+				o := o
+				o.Width = pages[i].width
+				buf, err := browser.Shot(tab, pages[i].url, o)
+				if err != nil {
+					once.Do(func() { failed = shotErr(pages[i].url, err); cancel() })
+					continue
+				}
+				out[i] = buf
+			}
+		}()
+	}
+	for i := range pages {
+		if ctx.Err() != nil {
+			break
+		}
+		next <- i
+	}
+	close(next)
+	for range tabs {
+		<-done
+	}
+	if failed != nil {
+		return nil, failed
+	}
+	if err := first.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func shotErr(url string, err error) error {
+	if strings.Contains(err.Error(), "ERR_CONNECTION_REFUSED") {
+		return fmt.Errorf("%s: nothing answers there; start the app or fix --base", url)
+	}
+	return fmt.Errorf("%s: %w", url, err)
+}
+
+type shotDiff struct {
+	Page        string  `json:"page"`
+	Diff        string  `json:"diff"`
+	Changed     float64 `json:"changed_percent"`
+	SizeChanged bool    `json:"size_changed,omitempty"`
+}
+
+// diffShot compares a new shot with the file it replaces and saves the changes to diff/ beside it,
+// where ask never picks them up. A page without an earlier shot has nothing to compare.
+func diffShot(path, page string, after []byte) (*shotDiff, error) {
+	before, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		logf("%s: new page, nothing to compare", page)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r, err := imgdiff.Compare(before, after)
+	if err != nil {
+		return nil, fmt.Errorf("compare %s: %w", path, err)
+	}
+	dir := filepath.Join(filepath.Dir(path), "diff")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	d := &shotDiff{Page: page, Diff: filepath.Join(dir, filepath.Base(path)), Changed: math.Round(r.Changed*100) / 100, SizeChanged: r.SizeChanged}
+	if err := writeAtomic(d.Diff, r.PNG); err != nil {
+		return nil, err
+	}
+	note := ""
+	if d.SizeChanged {
+		note = ", size changed"
+	}
+	logf("%s: %.2f%% changed%s, diff %s", page, d.Changed, note, d.Diff)
+	return d, nil
+}
+
+// parseSizes reads a list of widths such as 390,768,1440.
+func parseSizes(list string) ([]int, error) {
+	var out []int
+	for f := range strings.SplitSeq(list, ",") {
+		w, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil {
+			return nil, fmt.Errorf("--sizes %q: want widths like 390,768,1440", list)
+		}
+		if slices.Contains(out, w) {
+			return nil, fmt.Errorf("--sizes lists %d twice", w)
+		}
+		out = append(out, w)
+	}
+	return out, nil
+}
+
+// atSizes turns each page into one target per width, named name@width.
+func atSizes(pages []target, widths []int) []target {
+	var out []target
+	for _, p := range pages {
+		for _, w := range widths {
+			out = append(out, target{name: fmt.Sprintf("%s@%d", p.name, w), url: p.url, width: w})
 		}
 	}
-	return emit(map[string][]string{"shots": paths}, func() {})
+	return out
 }
 
 var shotName = regexp.MustCompile(`^(\d+)-(.+)\.png$`)
@@ -378,7 +548,10 @@ func writeAtomic(path string, data []byte) error {
 	return err
 }
 
-type target struct{ name, url string }
+type target struct {
+	name, url string
+	width     int
+}
 
 func shotTargets(base string, args []string) ([]target, error) {
 	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
@@ -395,7 +568,7 @@ func shotTargets(base string, args []string) ([]target, error) {
 		if !ok || name == "" {
 			return nil, fmt.Errorf("%q is not name=/path", a)
 		}
-		if strings.ContainsAny(name, `/\. `) {
+		if strings.ContainsAny(name, `/\. @`) {
 			return nil, fmt.Errorf("page name %q must be a plain word like inbox-connect", name)
 		}
 		if seen[name] {
@@ -405,7 +578,7 @@ func shotTargets(base string, args []string) ([]target, error) {
 		if !strings.HasPrefix(path, "/") {
 			path = "/" + path
 		}
-		out = append(out, target{name, base + path})
+		out = append(out, target{name: name, url: base + path})
 	}
 	return out, nil
 }
@@ -424,6 +597,7 @@ func ask(ctx context.Context, args []string) error {
 	dry := fs.Bool("dry-run", false, "print the prompt and files, send nothing")
 	chat := fs.String("chat", "", "continue this ChatGPT conversation URL, or \"latest\" for the newest in the sidebar (the session adopts it)")
 	collect := fs.Bool("collect", false, "send nothing; save the answer to the chat's last message (rerun a failed ask with the same flags)")
+	stream := fs.Bool("stream", false, "print the answer's text to stdout as ChatGPT writes it")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	var shots multi
 	fs.Var(&shots, "shot", "screenshot to attach (repeatable; a new chat defaults to SESSION/shots/*)")
@@ -438,6 +612,9 @@ func ask(ctx context.Context, args []string) error {
 	}
 	if *chat != "" && *chat != browser.Latest && !browser.IsChatURL(*chat) {
 		return usageError{fmt.Errorf("--chat %q is not a ChatGPT conversation URL (https://chatgpt.com/c/...) or latest", *chat)}
+	}
+	if *stream && jsonOut {
+		return usageError{errors.New("--stream prints text: it cannot go with --json")}
 	}
 	if *newChat && (*chat != "" || *collect) {
 		return usageError{errors.New("--new starts an empty chat: it cannot go with --chat or --collect")}
@@ -515,6 +692,12 @@ func ask(ctx context.Context, args []string) error {
 		return err
 	}
 	defer closeTab()
+	var onText func(string)
+	var live streamer
+	if *stream {
+		live.w = os.Stdout
+		onText = live.update
+	}
 	res, err := browser.Ask(tab, browser.Request{
 		Prompt:     text,
 		ChatURL:    sess.ChatURL,
@@ -523,6 +706,7 @@ func ask(ctx context.Context, args []string) error {
 		Collect:    *collect,
 		Timeout:    *timeout,
 		Log:        logf,
+		OnText:     onText,
 		OnChat: func(u string) {
 			if err := sess.Adopt(u, time.Now()); err != nil {
 				logf("warning: could not save the chat URL: %v", err)
@@ -541,6 +725,7 @@ func ask(ctx context.Context, args []string) error {
 		}
 		return err
 	}
+	live.end()
 	now := time.Now()
 	e, err := output.Save(sess.Dir(), text, res, output.Entry{Mode: *mode, At: now, Shots: relAll(sess.Dir(), files)})
 	if err != nil {
@@ -570,6 +755,35 @@ func ask(ctx context.Context, args []string) error {
 		}
 		fmt.Println("chat:", sess.ChatURL)
 	})
+}
+
+// streamer prints the answer as it grows. It prints only what is new, so if ChatGPT rewrites text
+// it has already shown, the screen keeps the old wording; chat.md always holds the final answer.
+type streamer struct {
+	w     io.Writer
+	shown string
+}
+
+func (s *streamer) update(text string) {
+	if len(text) <= len(s.shown) {
+		return
+	}
+	i := len(s.shown)
+	if !strings.HasPrefix(text, s.shown) {
+		// Start the tail on a whole character.
+		for i < len(text) && !utf8.RuneStart(text[i]) {
+			i++
+		}
+	}
+	fmt.Fprint(s.w, text[i:])
+	s.shown = text
+}
+
+// end closes the streamed text with a blank line, so the run's summary stands apart.
+func (s *streamer) end() {
+	if s.shown != "" {
+		fmt.Fprint(s.w, "\n\n")
+	}
 }
 
 // nonNil keeps an empty list as [] in JSON, not null.
@@ -606,21 +820,32 @@ func session(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("session", flag.ContinueOnError)
 	project := fs.String("project", ".", "project directory; memory lives in its design/chatgpt/")
 	sessionID := fs.String("session", "", "session id (default: the agent's session)")
+	out := fs.String("out", "", "export: the HTML file to write (default: session.html in the session folder)")
 	fs.BoolVar(&jsonOut, "json", false, "print JSON")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: chatgpt-design session [show|list]")
+		fmt.Fprintln(os.Stderr, "usage: chatgpt-design session [show|list|export [--out FILE]]")
 		fs.PrintDefaults()
 	}
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	p, err := memory.Open(*project)
-	if err != nil {
-		return err
-	}
 	verb := "show"
 	if fs.NArg() > 0 {
 		verb = fs.Arg(0)
+		// Flags may follow the command too: session export --out x.html.
+		if err := parse(fs, fs.Args()[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() > 0 {
+			return usageError{fmt.Errorf("unexpected %q", fs.Arg(0))}
+		}
+	}
+	if *out != "" && verb != "export" {
+		return usageError{errors.New("--out goes with session export")}
+	}
+	p, err := memory.Open(*project)
+	if err != nil {
+		return err
 	}
 	switch verb {
 	case "show":
@@ -661,8 +886,30 @@ func session(_ context.Context, args []string) error {
 				fmt.Printf("%s %s  %s  %d ask(s)  %s\n", mark, s.ID, s.Updated.Local().Format("2006-01-02 15:04"), s.Asks, s.ChatURL)
 			}
 		})
+	case "export":
+		id, err := memory.SessionID(*sessionID, os.Getenv)
+		if err != nil {
+			return err
+		}
+		s, err := p.Session(id, time.Now())
+		if err != nil {
+			return err
+		}
+		page, err := export.HTML(export.Session{ID: s.ID, Dir: s.Dir(), ChatURL: s.ChatURL, Asks: s.Asks, Created: s.Created, Updated: s.Updated})
+		if err != nil {
+			return err
+		}
+		if *out == "" {
+			*out = filepath.Join(s.Dir(), "session.html")
+		}
+		if err := writeAtomic(*out, page); err != nil {
+			return err
+		}
+		return emit(struct {
+			File string `json:"file"`
+		}{*out}, func() { fmt.Println(*out) })
 	default:
-		return usageError{fmt.Errorf("unknown session command %q, want show or list", verb)}
+		return usageError{fmt.Errorf("unknown session command %q, want show, list or export", verb)}
 	}
 }
 

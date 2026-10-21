@@ -45,6 +45,7 @@ design/chatgpt/<session>/
 
 - `chatgpt-design session` prints the folder, the chat URL and the number of asks. Read `<session>/chat.md` for earlier answers.
 - `chatgpt-design session list` lists every session in the project.
+- `chatgpt-design session export` writes `<session>/session.html`: the whole session with its images built in, one file to open or share. Offer it when the user wants to show the work to someone.
 
 ## Steps
 
@@ -65,7 +66,8 @@ design/chatgpt/<session>/
      chatgpt-design shoot --base http://localhost:3000 overview=/ 'settings=/settings?tab=team'
      ```
 
-   - Each `name=path` argument becomes `<session>/shots/NN-name.png` at 1440×900. Quote any argument with `?` or `&`, because zsh expands them. Add `--full` for whole pages, `--mobile` for a phone at 390×844, and `--dark` for the dark color scheme.
+   - Each `name=path` argument becomes `<session>/shots/NN-name.png` at 1440×900. Quote any argument with `?` or `&`, because zsh expands them. Add `--full` for whole pages, `--mobile` for a phone at 390×844, and `--dark` for the dark color scheme. `--sizes 390,768,1440` shoots each page at every width as `NN-name@WIDTH.png`; mind the limit of 10 shots per ask.
+   - After applying a redesign, shoot the same names again with `--diff`. It prints how much of each page changed and saves the changes in red to `shots/diff/`, which no ask sends.
    - Shooting a name again replaces its file and keeps its number. A page that answers with HTTP 400 or more fails the run, so fix the path or start the app first.
    - Or drop existing images into `<session>/shots/`.
    - The first ask of a chat attaches every shot in `shots/`. Follow-ups attach only the `--shot` files you pass, because the chat already has the rest.

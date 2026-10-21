@@ -131,3 +131,20 @@ func mobileUA(ua string) string {
 	}
 	return ua
 }
+
+// Tab opens one more tab in the browser behind ctx, set up like Start's first tab, so pages can
+// load side by side. Its cancel closes only that tab.
+func Tab(ctx context.Context, o Options) (context.Context, context.CancelFunc, error) {
+	tctx, cancel := chromedp.NewContext(ctx)
+	if err := chromedp.Do(tctx); err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("open a tab: %w", err)
+	}
+	if o.Headless || o.Mobile {
+		if err := setUserAgent(tctx, o.Mobile); err != nil {
+			cancel()
+			return nil, nil, fmt.Errorf("open a tab: %w", err)
+		}
+	}
+	return tctx, cancel, nil
+}

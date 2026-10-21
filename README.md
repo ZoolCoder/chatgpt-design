@@ -77,7 +77,10 @@ The session id comes from, in order: `--session ID`, `CHATGPT_DESIGN_SESSION`, t
 ```sh
 chatgpt-design session        # this session: folder, chat URL, number of asks
 chatgpt-design session list   # every session in the project, * marks this one
+chatgpt-design session export # the whole session as one HTML file, images inside
 ```
+
+`session export` writes `session.html` in the session folder (or `--out FILE`): every prompt and answer with its images built in, so it opens offline and can be shared as one file. It inlines only images inside the session folder and drops any raw HTML in the answers.
 
 Each project keeps its memory in `design/chatgpt/`, at the root of the git repository you run from (or `--project DIR`):
 
@@ -87,6 +90,8 @@ design/chatgpt/<session>/
   chat.md                          every prompt and answer, images inline
   images/                          01.png, 02.png ... numbered across the session
   shots/                           screenshots to send
+  shots/diff/                      what changed since the last shot (shoot --diff), never sent
+  session.html                     session export
   brief.md                         optional brief
 ```
 
@@ -107,7 +112,10 @@ Each `name=path` becomes `NN-name.png` at 1440×900, in the current session's `s
 | `--full` | off | whole page instead of the viewport |
 | `--mobile` | off | a phone: 390×844 at 3x, touch, mobile user agent |
 | `--dark` | off | `prefers-color-scheme: dark` |
+| `--sizes` | | shoot each page at these widths, e.g. `390,768,1440`, as `NN-name@WIDTH.png`; not with `--width` |
+| `--diff` | off | compare each page with the shot it replaces; prints the share of pixels that changed and saves the changes in red to `shots/diff/` |
 
+Pages load four at a time, in tabs of one Chrome.
 It uses a throwaway headless profile and never your ChatGPT one.
 
 ### `ask`: send to ChatGPT
@@ -128,6 +136,7 @@ chatgpt-design ask --mode spec --goal "fewer setup steps for non-developers"
 | Flag | |
 |---|---|
 | `--new` | start a new ChatGPT chat in this session |
+| `--stream` | print the answer on stdout as ChatGPT writes it; not with `--json` |
 | `--collect` | send nothing; save the answer to the chat's last message. Rerun a failed or timed-out ask with the same flags plus `--collect` |
 | `--chat URL\|latest` | continue that conversation and save it in the session; `latest` is the newest chat under Recents in the sidebar (pinned chats are skipped) |
 | `--session ID` | use this session instead of the agent's |

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -117,5 +118,41 @@ func TestExitCode(t *testing.T) {
 		if got := exitCode(tc.err); got != tc.want {
 			t.Errorf("exitCode(%v) = %d, want %d", tc.err, got, tc.want)
 		}
+	}
+}
+
+func TestStreamer(t *testing.T) {
+	var b strings.Builder
+	s := streamer{w: &b}
+	for _, text := range []string{"Hel", "Hello", "Hello", "Hello wo", "Hullo world", "Hullo"} {
+		s.update(text)
+	}
+	s.end()
+	if got := b.String(); got != "Hello wo"+"rld"+"\n\n" {
+		t.Errorf("streamed %q", got)
+	}
+	var quiet strings.Builder
+	(&streamer{w: &quiet}).end()
+	if quiet.Len() != 0 {
+		t.Errorf("empty stream printed %q", quiet.String())
+	}
+}
+
+func TestSizes(t *testing.T) {
+	got, err := parseSizes("390, 1440")
+	if err != nil || !slices.Equal(got, []int{390, 1440}) {
+		t.Fatalf("%v %v", got, err)
+	}
+	for _, bad := range []string{"", "390,x", "390,390"} {
+		if _, err := parseSizes(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	pages := atSizes([]target{{name: "home", url: "u"}}, got)
+	if len(pages) != 2 || pages[0].name != "home@390" || pages[1].width != 1440 {
+		t.Errorf("%+v", pages)
+	}
+	if _, err := shotTargets("http://x", []string{"a@1=/"}); err == nil {
+		t.Error("@ in a page name accepted")
 	}
 }

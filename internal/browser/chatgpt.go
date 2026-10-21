@@ -41,11 +41,12 @@ var ErrUsageLimit = errors.New("ChatGPT usage limit")
 // Request is one message to ChatGPT.
 type Request struct {
 	Prompt     string
-	ChatURL    string           // continue this conversation; empty starts a new one
-	Files      []string         // absolute paths of images to attach
-	WantImages bool             // the answer is not done until it carries an image
-	Collect    bool             // send nothing; wait for and read the answer to the chat's last message
-	OnChat     func(url string) // called once the conversation URL is known, before the answer is in
+	ChatURL    string            // continue this conversation; empty starts a new one
+	Files      []string          // absolute paths of images to attach
+	WantImages bool              // the answer is not done until it carries an image
+	Collect    bool              // send nothing; wait for and read the answer to the chat's last message
+	OnChat     func(url string)  // called once the conversation URL is known, before the answer is in
+	OnText     func(text string) // called with the answer's text so far, on every poll while it grows
 	Timeout    time.Duration
 	Log        func(format string, args ...any)
 }
@@ -429,12 +430,14 @@ type answerState struct {
 	Limit  string `json:"limit"`
 	ErrMsg string `json:"err"`
 	Retry  bool   `json:"retry"`
+	Done   bool   `json:"finished"`
+	Text   string `json:"text"`
 }
 
 // answerJS reads only what follows the last user turn, so text in earlier turns never reads as a
 // limit or an error. Limits, errors and progress notes must also sit outside the answer, which may
 // well quote them; only a near-empty answer counts as an image-progress placeholder.
-var answerJS = js(`(() => {
+var answerJS = js(`((wantText) => {
   const turns = NEW_TURNS;
   const last = turns[turns.length - 1];
   const stop = !!document.querySelector(STOP);
@@ -453,15 +456,19 @@ var answerJS = js(`(() => {
   }
   const limit = (outside.match(/You[’']ve (?:hit|reached) [^.\n{]*limit[^.\n{]*(?![^.\n]*\{)/i) || [''])[0];
   const err = (outside.match(/Something went wrong[^\n]*|There was an error generating a response/i) || [''])[0];
-  const retry = [...document.querySelectorAll('button')].some(b => isNew(b) && /^(retry|try again|regenerate)$/i.test(b.innerText.trim()));
+  const buttons = [...document.querySelectorAll('button')].filter(isNew);
+  const retry = buttons.some(b => /^(retry|try again|regenerate)$/i.test(b.innerText.trim()));
+  // ChatGPT adds the answer's action bar, with Read aloud, only once the whole turn is done.
+  const finished = buttons.some(b => /^read aloud$/i.test(b.getAttribute('aria-label') || ''));
   const big = i => i.complete && (i.naturalWidth || 0) >= 256;
   const gen = NEW_GENERATED.filter(big).length;
   const progress = /creating image|generating image|image is being/i;
   const busy = progress.test(outside) || (body.trim().length < 80 && progress.test(body));
-  if (!turns.length) return { n: 0, stop, len: 0, imgs: gen, busy, limit, err, retry };
+  if (!turns.length) return { n: 0, stop, len: 0, imgs: gen, busy, limit, err, retry, finished, text: '' };
   const scope = last.closest('article') || last;
   const imgs = gen + [...scope.querySelectorAll('img')].filter(big).length;
-  return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err, retry };
+  const text = wantText ? turns.flatMap(t => BODIES(t)).map(b => b.innerText).join('\n\n') : '';
+  return { n: turns.length, stop, len: scope.innerText.length, imgs, busy, limit, err, retry, finished, text };
 })`)
 
 // retryJS clicks ChatGPT's own retry button under the failed answer.
@@ -473,11 +480,12 @@ var retryJS = js(`(() => {
 })()`)
 
 func waitAnswer(ctx context.Context, r Request) error {
-	check := "(" + answerJS + ")()"
-	// The answer must hold still this long: images keep loading after the text has stopped.
-	settle := 4 * time.Second
+	check := "(" + answerJS + ")(" + strconv.FormatBool(r.OnText != nil) + ")"
+	// The answer must hold still this long: images keep loading after the text has stopped. Once
+	// ChatGPT marks the turn finished, a short wait only catches the last image swap.
+	settle, quick := 4*time.Second, time.Second
 	if r.WantImages {
-		settle = 8 * time.Second
+		settle, quick = 8*time.Second, 2*time.Second
 	}
 	var prev answerState
 	var still time.Time
@@ -520,8 +528,11 @@ func waitAnswer(ctx context.Context, r Request) error {
 			still = time.Time{}
 		case still.IsZero():
 			still = time.Now()
-		case time.Since(still) >= settle:
+		case time.Since(still) >= settle, st.Done && time.Since(still) >= quick:
 			return nil
+		}
+		if r.OnText != nil && st.Text != "" {
+			r.OnText(st.Text)
 		}
 		prev = st
 		if now := time.Now(); now.After(beat) {

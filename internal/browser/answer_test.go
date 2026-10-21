@@ -60,6 +60,7 @@ func TestAnswerJS(t *testing.T) {
 		n, imgs     int
 		limit, err  string
 		retry, busy bool
+		done        bool
 	}{
 		{name: "clean answer, noisy history", n: 1,
 			html: oldTurns + `<div data-message-author-role="user">why did it say Something went wrong?</div>` + answer("All good.") + composer},
@@ -75,6 +76,10 @@ func TestAnswerJS(t *testing.T) {
 			html: `<div data-message-author-role="user">q</div>` + answer("Creating image")},
 		{name: "answer quotes progress and limit", n: 1,
 			html: `<div data-message-author-role="user">q</div>` + answer(`Rename the "Generating image…" label, and soften "You've reached the limit of 3 projects" in the paywall copy. `+strings.Repeat("More critique. ", 10))},
+		{name: "finished turn", n: 1, done: true,
+			html: `<div data-message-author-role="user">q</div><button aria-label="Copy message"></button>` + answer("Done.") + `<button aria-label="Read aloud"></button>`},
+		{name: "user actions only", n: 1,
+			html: `<div data-message-author-role="user">q</div><button aria-label="Copy message"></button>` + answer("Still writing")},
 		{name: "progress outside the answer", n: 1, busy: true,
 			html: `<div data-message-author-role="user">q</div>` + answer("Here is the mockup with a long description of what changed in it.") + `<div>Creating image</div>`},
 	} {
@@ -84,9 +89,16 @@ func TestAnswerJS(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if st.N != tc.n || st.Limit != tc.limit || st.ErrMsg != tc.err || st.Retry != tc.retry || st.Busy != tc.busy {
+			if st.N != tc.n || st.Limit != tc.limit || st.ErrMsg != tc.err || st.Retry != tc.retry || st.Busy != tc.busy || st.Done != tc.done {
 				t.Errorf("got %+v", st)
 			}
 		})
 	}
+	t.Run("text for streaming", func(t *testing.T) {
+		setBody(t, ctx, oldTurns+`<div data-message-author-role="user">q</div>`+answer("Part one")+`<p>noise</p>`)
+		st, err := eval[answerState](ctx, "("+answerJS+")(true)")
+		if err != nil || st.Text != "Part one" {
+			t.Errorf("text = %q, %v", st.Text, err)
+		}
+	})
 }
