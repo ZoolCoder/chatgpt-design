@@ -117,4 +117,20 @@ Long asks print `still waiting (...)` to stderr every 30 seconds. That is progre
 
 Add `--json` to `doctor`, `status`, `session`, `shoot` or `ask` to get the result as JSON on stdout. On failure it prints `{"ok": false, "error": ..., "exit": N}`.
 
+## With Claude in Chrome
+
+This section applies only when the `mcp__claude-in-chrome__*` tools are available. They act in the user's everyday Chrome, which is a different browser from the CLI's profile and has its own ChatGPT sign-in. The CLI stays the default for `ask`: it saves full-resolution images and costs no screenshots. Use the extension for these three cases:
+
+- **Fallback ask.** Use it when the CLI is missing or its `login` check fails and the user prefers not to set it up. Ask the user first.
+  1. Open a new tab on chatgpt.com.
+  2. Attach the shots with `file_upload`.
+  3. Paste the prompt: the one `ask --dry-run` prints, or one you write from the brief.
+  4. Read the answer with `get_page_text` and append the prompt and answer to `<session>/chat.md`.
+  - Generated images stay in the chat: give the chat URL and say they were not saved.
+  - Step 4's confirmation applies unchanged.
+- **Pages behind the app's login.** `shoot` cannot reach these, but the user's Chrome can. View them there to describe or critique them. Those screenshots reach you only as images, never as files. If one must go to ChatGPT, ask the user to save it into `<session>/shots/`. The personal-data warning applies.
+- **Review.** In step 6, open the chat URL, or `file://<session>/session.html` after `session export`, in a new tab, so the user sees the result with you.
+
+If chatgpt.com shows a sign-in page, the user signs in in that tab.
+
 Never type the user's ChatGPT password and never handle their cookies. The CLI keeps the session in its own Chrome profile and never prints it.
